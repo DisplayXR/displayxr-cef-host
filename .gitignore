@@ -1,0 +1,18 @@
+# Build output
+build/
+build_*/
+build_log.txt
+out/
+
+# Downloaded dependencies (fetched by scripts/setup-deps.bat into C:\dev\...)
+# CEF and the OpenXR loader are NOT vendored — see scripts/setup-deps.bat.
+
+# Local capture artifacts
+*.bmp
+*.png
+
+# Editor / OS cruft
+.vs/
+*.user
+Thumbs.db
+.DS_Store

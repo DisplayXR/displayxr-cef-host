@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<!-- Copyright 2026, DisplayXR — SPDX-License-Identifier: BSL-1.0 -->
+<!-- Demo page for the CEF OSR weave host (#625, Step A). -->
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DisplayXR inline-3D demo (#625)</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="wrap">
+        <h1>Inline 3D in the page</h1>
+        <p class="muted">CEF offscreen-render &rarr; the host drives the real display-processor
+            weave through <code>XR_EXT_weave</code>. The host never weaves; the 3D element below is a
+            side-by-side canvas whose flat pixels are replaced by the woven 3D in the host's present
+            surface. Scroll, zoom, and drag the window &mdash; the lattice must stay locked.</p>
+
+        <h2>Above the element</h2>
+        <p>This is ordinary 2D DOM content forming the surround. It scrolls normally. The 3D element
+            participates in page flow, so scrolling moves it &mdash; the host tracks its committed
+            device-pixel rect every frame and feeds it to the weave RPC as the window-relative rect.</p>
+        <p>As the viewer's head moves, the runtime's tracked eyes flow back to this page, which
+            re-renders the element off-axis (look-around) using an asymmetric-frustum projection.</p>
+
+        <!-- THE 3D element. The host weaves this exact rect. -->
+        <canvas id="el3d" class="element3d"></canvas>
+
+        <h2>Below the element</h2>
+        <p>More surround text so the page is comfortably scrollable. Use the mouse wheel or Page
+            Down to scroll the 3D element across the viewport while watching the live display for any
+            lattice drift or 3D collapse.</p>
+        <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt
+            ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation.</p>
+        <p>Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat
+            nulla pariatur. Excepteur sint occaecat cupidatat non proident.</p>
+        <p>Sunt in culpa qui officia deserunt mollit anim id est laborum. Curabitur pretium tincidunt
+            lacus. Nulla gravida orci a odio. Nullam varius, turpis et commodo pharetra.</p>
+        <p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis
+            egestas. Proin pharetra nonummy pede. Mauris et orci.</p>
+        <p>Aenean nec lorem. In porttitor. Donec laoreet nonummy augue. Suspendisse dui purus,
+            scelerisque at, vulputate vitae, pretium mattis, nunc.</p>
+        <p>Mauris eget neque at sem venenatis eleifend. Ut nonummy. Fusce aliquet pede non pede.
+            Suspendisse dapibus lorem pellentesque magna.</p>
+    </div>
+
+    <div id="hud" class="hud">starting…</div>
+    <script src="app.js"></script>
+</body>
+</html>
