@@ -147,10 +147,7 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return 0;
 	case WM_MOVING:
 	case WM_SIZING:
-		// Sent SYNCHRONOUSLY on every mouse-move during the drag — the reliable
-		// per-step render hook. Pump CEF (page keeps animating) + weave at the new
-		// window position + present; the DP re-snaps the interlace phase. Fall
-		// through to DefWindowProc so the move/size still applies.
+		// Per-step render hook during the drag (delivered synchronously each step).
 		RunOneFrame();
 		break;
 	case WM_TIMER:
