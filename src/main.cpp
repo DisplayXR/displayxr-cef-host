@@ -73,18 +73,19 @@ static HostBridge *g_bridge = nullptr;
 static CefHostClient *g_client = nullptr; // lifetime held by a CefRefPtr in wWinMain
 static bool g_frameReady = false;         // setup complete — safe to render frames
 static bool g_isMoving = false;           // inside a modal move/resize loop
+static bool g_inFrame = false;            // whole-frame re-entrancy guard
 static const UINT_PTR kMoveTimerId = 1;   // fires inside the modal loop to render
 static double g_latSum = 0.0;
 static uint32_t g_latCount = 0;
 static uint64_t g_frameIdx = 0;
 
 static void MaybeDumpComposite();
-// pumpCef=false skips CefDoMessageLoopWork — REQUIRED when called from WM_PAINT
-// inside the modal move/resize loop, because CefDoMessageLoopWork itself pumps
-// the Win32 queue (it dispatches our WM_PAINT), so calling it from WM_PAINT
-// recurses infinitely. During a window move the page content is static, so we
-// just re-weave the cached page texture at the new window position and present.
-static void RunOneFrame(bool pumpCef = true);
+// One full frame: pump CEF (so the page keeps animating, even during a drag),
+// handle resize, weave, composite, present. A whole-frame re-entrancy guard
+// (g_inFrame) makes this safe to call from any message handler: CefDoMessageLoopWork
+// itself pumps the Win32 queue and can dispatch WM_PAINT/WM_TIMER mid-pump, which
+// would otherwise re-enter RunOneFrame and recurse infinitely (the earlier hang).
+static void RunOneFrame();
 
 // Forward a wheel/move/click to the offscreen browser (OSR has no real HWND, so
 // the embedder must inject input). Coords are client/device px (dpr handled by
@@ -124,31 +125,38 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		return 0;
 
-	// --- WM_PAINT trick: keep weaving during the modal move/resize loop ------
+	// --- keep rendering during the modal move/resize loop -------------------
 	// Windows runs an internal loop inside DefWindowProc during a drag that
-	// blocks our frame loop. It still dispatches WM_PAINT, so we render one frame
-	// there and never validate the window — Windows keeps sending WM_PAINT, so
-	// the weave keeps flowing and re-snaps to the moving window position.
-	// (docs/reference/window-drag-rendering.md, app-owned-window case.)
+	// blocks our main frame loop. WM_MOVING/WM_SIZING are dispatched into it
+	// synchronously on every step, so we render a full frame there (the doc's
+	// WM_PAINT trick doesn't work here — WM_PAINT is starved by the mouse-move
+	// flood). docs/reference/window-drag-rendering.md, app-owned-window case.
 	case WM_ENTERSIZEMOVE:
 		g_isMoving = true;
-		// A timer fires reliably inside the modal move/resize loop (WM_PAINT is
-		// starved during a fast drag of a DWM-composited swapchain window). It
-		// drives one weave+present per tick so the 3D re-snaps to the moving
-		// window position. ~8 ms ≈ 120 Hz.
+		// Drive a full frame (CEF pump + weave + present) inside the modal loop.
+		// WM_TIMER is a low-priority message and gets starved during an active
+		// drag (queue full of WM_MOUSEMOVE), so it's only a fallback for
+		// click-and-hold; the per-step rendering during a drag comes from
+		// WM_MOVING / WM_SIZING, which are delivered synchronously each step.
 		SetTimer(hwnd, kMoveTimerId, 8, nullptr);
-		InvalidateRect(hwnd, nullptr, FALSE);
+		RunOneFrame();
 		return 0;
 	case WM_EXITSIZEMOVE:
 		g_isMoving = false;
 		KillTimer(hwnd, kMoveTimerId);
 		return 0;
+	case WM_MOVING:
+	case WM_SIZING:
+		// Sent SYNCHRONOUSLY on every mouse-move during the drag — the reliable
+		// per-step render hook. Pump CEF (page keeps animating) + weave at the new
+		// window position + present; the DP re-snaps the interlace phase. Fall
+		// through to DefWindowProc so the move/size still applies.
+		RunOneFrame();
+		break;
 	case WM_TIMER:
-		// Sole render source inside the modal move/resize loop. Present(1,0) inside
-		// the handler keeps the window position stable across weave→present, so the
-		// 3D phase matches what is shown; ~8 ms timer coalesces to vsync.
-		if (wParam == kMoveTimerId && g_isMoving && g_frameReady) {
-			RunOneFrame(false); // re-weave cached page at new window pos; NO CEF pump
+		// Fallback for click-and-hold (mouse not moving → no WM_MOVING).
+		if (wParam == kMoveTimerId && g_isMoving) {
+			RunOneFrame();
 			return 0;
 		}
 		break;
@@ -441,17 +449,20 @@ DemoPageUrl()
 // Callable from the main loop AND from the WM_PAINT handler during a modal
 // move/resize (the WM_PAINT trick keeps the weave flowing while dragging).
 static void
-RunOneFrame(bool pumpCef)
+RunOneFrame()
 {
 	if (!g_frameReady || !g_xr || !g_comp || !g_bridge || !g_swapChain) {
 		return;
 	}
-	if (pumpCef) {
-		PollEvents(*g_xr);
-		CefDoMessageLoopWork(); // OnAcceleratedPaint / OnQuery fire here
+	// Whole-frame re-entrancy guard: CefDoMessageLoopWork pumps the Win32 queue
+	// and can dispatch WM_PAINT/WM_TIMER mid-pump, re-entering this function. Run
+	// only the outermost frame to completion; drop re-entrant calls.
+	if (g_inFrame) {
+		return;
 	}
-	// (When !pumpCef — modal move/resize loop — skip CEF: it would re-enter
-	//  CefDoMessageLoopWork via its internal Win32 pump and recurse forever.)
+	g_inFrame = true;
+	PollEvents(*g_xr);
+	CefDoMessageLoopWork(); // OnAcceleratedPaint / OnQuery fire here (page keeps animating)
 
 	if (g_resized) {
 		g_resized = false;
@@ -474,15 +485,6 @@ RunOneFrame(bool pumpCef)
 
 	double ms = 0.0;
 	bool wove = g_comp->Frame(g_xr->session, g_swapChain.Get(), g_clientW, g_clientH, *g_bridge, &ms);
-	if (!pumpCef) {
-		// Diagnostic for the modal-drag path: confirm frames flow + weave succeeds.
-		static uint32_t mv = 0;
-		if ((mv++ % 30) == 0) {
-			RECT wr = {};
-			GetWindowRect(g_hwnd, &wr);
-			LOG_INFO("MOVE-frame %u: win=(%d,%d) wove=%d last=%.3f ms", mv, wr.left, wr.top, wove ? 1 : 0, ms);
-		}
-	}
 	if (wove) {
 		MaybeDumpComposite();
 		g_swapChain->Present(1, 0);
@@ -491,14 +493,15 @@ RunOneFrame(bool pumpCef)
 		g_latCount++;
 		if ((g_frameIdx % 120) == 0 && g_latCount > 0) {
 			LOG_INFO("weave round-trip: last=%.3f ms avg=%.3f ms (%u) rect=%d,%d %ux%u "
-			         "eyes(valid=%d track=%d n=%u L.x=%.4f R.x=%.4f) pageFrame=%llu",
+			         "eyes(valid=%d track=%d n=%u L.x=%.4f R.x=%.4f) pageFrame=%llu mv=%d",
 			         ms, g_latSum / g_latCount, g_latCount, g_bridge->rectX, g_bridge->rectY, g_bridge->rectW,
 			         g_bridge->rectH, g_bridge->eyesValid, g_bridge->eyesTracking, g_bridge->eyeCount,
 			         g_bridge->eyes[0], g_bridge->eyeCount >= 2 ? g_bridge->eyes[3] : 0.0f,
-			         (unsigned long long)g_bridge->pageFrame);
+			         (unsigned long long)g_bridge->pageFrame, g_isMoving ? 1 : 0);
 		}
 		g_frameIdx++;
 	}
+	g_inFrame = false;
 }
 
 // -----------------------------------------------------------------------------
