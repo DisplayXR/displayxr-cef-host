@@ -83,7 +83,12 @@ static uint32_t g_latCount = 0;
 static uint64_t g_frameIdx = 0;
 
 static void MaybeDumpComposite();
-static void RunOneFrame();
+// pumpCef=false skips CefDoMessageLoopWork — REQUIRED when called from WM_PAINT
+// inside the modal move/resize loop, because CefDoMessageLoopWork itself pumps
+// the Win32 queue (it dispatches our WM_PAINT), so calling it from WM_PAINT
+// recurses infinitely. During a window move the page content is static, so we
+// just re-weave the cached page texture at the new window position and present.
+static void RunOneFrame(bool pumpCef = true);
 
 // Forward a wheel/move/click to the offscreen browser (OSR has no real HWND, so
 // the embedder must inject input). Coords are client/device px (dpr handled by
@@ -138,7 +143,7 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return 0;
 	case WM_PAINT:
 		if (g_isMoving && g_frameReady) {
-			RunOneFrame();           // render inline; do NOT Begin/EndPaint
+			RunOneFrame(false);      // re-weave cached page; NO CEF pump (recurses)
 			InvalidateRect(hwnd, nullptr, FALSE); // stay invalid → next WM_PAINT
 			return 0;
 		}
@@ -439,13 +444,17 @@ DemoPageUrl()
 // Callable from the main loop AND from the WM_PAINT handler during a modal
 // move/resize (the WM_PAINT trick keeps the weave flowing while dragging).
 static void
-RunOneFrame()
+RunOneFrame(bool pumpCef)
 {
 	if (!g_frameReady || !g_xr || !g_comp || !g_bridge || !g_swapChain) {
 		return;
 	}
-	PollEvents(*g_xr);
-	CefDoMessageLoopWork(); // OnAcceleratedPaint / OnQuery fire here
+	if (pumpCef) {
+		PollEvents(*g_xr);
+		CefDoMessageLoopWork(); // OnAcceleratedPaint / OnQuery fire here
+	}
+	// (When !pumpCef — modal move/resize loop — skip CEF: it would re-enter
+	//  CefDoMessageLoopWork via its internal Win32 pump and recurse forever.)
 
 	if (g_resized) {
 		g_resized = false;
