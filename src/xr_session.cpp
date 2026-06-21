@@ -16,6 +16,7 @@
 bool g_hasWeaveExt = false;
 PFN_xrWeaveBindWindowEXT g_pfnWeaveBindWindow = nullptr;
 PFN_xrWeaveSubmitEXT g_pfnWeaveSubmit = nullptr;
+PFN_xrWeaveSnapWindowRectEXT g_pfnWeaveSnapWindowRect = nullptr;
 
 #define XR_CHECK(call)                                                                                                  \
 	do {                                                                                                               \
@@ -180,8 +181,13 @@ CreateSession(XrSessionManager &xr, ID3D11Device *d3d11Device, HWND appHwnd)
 	// Resolve the weave entry points.
 	xrGetInstanceProcAddr(xr.instance, "xrWeaveBindWindowEXT", (PFN_xrVoidFunction *)&g_pfnWeaveBindWindow);
 	xrGetInstanceProcAddr(xr.instance, "xrWeaveSubmitEXT", (PFN_xrVoidFunction *)&g_pfnWeaveSubmit);
-	LOG_INFO("xrWeaveBindWindowEXT: %s, xrWeaveSubmitEXT: %s", g_pfnWeaveBindWindow ? "resolved" : "NULL",
-	         g_pfnWeaveSubmit ? "resolved" : "NULL");
+	// #625 window-drag phase lock — optional: an older runtime (spec v1) won't
+	// resolve it, in which case the host simply skips the snap and drags as before.
+	xrGetInstanceProcAddr(xr.instance, "xrWeaveSnapWindowRectEXT",
+	                      (PFN_xrVoidFunction *)&g_pfnWeaveSnapWindowRect);
+	LOG_INFO("xrWeaveBindWindowEXT: %s, xrWeaveSubmitEXT: %s, xrWeaveSnapWindowRectEXT: %s",
+	         g_pfnWeaveBindWindow ? "resolved" : "NULL", g_pfnWeaveSubmit ? "resolved" : "NULL",
+	         g_pfnWeaveSnapWindowRect ? "resolved" : "NULL");
 	if (!g_pfnWeaveBindWindow || !g_pfnWeaveSubmit) {
 		LOG_ERROR("Failed to resolve weave entry points");
 		return false;

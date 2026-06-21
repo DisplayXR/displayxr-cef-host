@@ -73,6 +73,7 @@ static HostBridge *g_bridge = nullptr;
 static CefHostClient *g_client = nullptr; // lifetime held by a CefRefPtr in wWinMain
 static bool g_frameReady = false;         // setup complete — safe to render frames
 static bool g_isMoving = false;           // inside a modal move/resize loop
+static POINT g_dragOrigin = {0, 0};        // window screen top-left at drag start (#625 phase-snap origin)
 static bool g_inFrame = false;            // whole-frame re-entrancy guard
 static const UINT_PTR kMoveTimerId = 1;   // fires inside the modal loop to render
 static double g_latSum = 0.0;
@@ -131,8 +132,17 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	// synchronously on every step, so we render a full frame there (the doc's
 	// WM_PAINT trick doesn't work here — WM_PAINT is starved by the mouse-move
 	// flood). docs/reference/window-drag-rendering.md, app-owned-window case.
-	case WM_ENTERSIZEMOVE:
+	case WM_ENTERSIZEMOVE: {
 		g_isMoving = true;
+		// Record the drag-start window top-left (screen px) — the phase-snap
+		// origin the runtime needs for the whole drag (#625). The interlace
+		// phase is locked relative to where the window started moving.
+		RECT wr = {};
+		if (GetWindowRect(hwnd, &wr)) {
+			g_dragOrigin.x = wr.left;
+			g_dragOrigin.y = wr.top;
+		}
+	}
 		// Drive a full frame (CEF pump + weave + present) inside the modal loop.
 		// WM_TIMER is a low-priority message and gets starved during an active
 		// drag (queue full of WM_MOUSEMOVE), so it's only a fallback for
@@ -157,6 +167,30 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			return 0;
 		}
 		break;
+
+	// --- phase-snap the window during a drag (#625) -------------------------
+	// Fires before the OS commits each move step. We hand the runtime the
+	// drag-start origin + the proposed top-left; the DP returns the nearest
+	// interlace-phase-aligned position (the vendor's SnapToPhase, run service-
+	// side — the snap math never leaves the DP, ADR-019), and we apply it so the
+	// woven 3D stays locked to the panel phase instead of jittering. Only during
+	// an active user drag, only when the position actually changes, and only if
+	// the runtime exposes the snap (older runtimes resolve NULL → drag as before).
+	case WM_WINDOWPOSCHANGING:
+		if (g_isMoving && g_pfnWeaveSnapWindowRect && g_xr) {
+			WINDOWPOS *pos = reinterpret_cast<WINDOWPOS *>(lParam);
+			if (pos && !(pos->flags & SWP_NOMOVE)) {
+				XrRect2Di origin = {{g_dragOrigin.x, g_dragOrigin.y}, {0, 0}};
+				XrRect2Di target = {{pos->x, pos->y}, {0, 0}};
+				XrRect2Di snapped = {};
+				XrResult sr = g_pfnWeaveSnapWindowRect(g_xr->session, &origin, &target, &snapped);
+				if (sr == XR_SUCCESS) {
+					pos->x = snapped.offset.x;
+					pos->y = snapped.offset.y;
+				}
+			}
+		}
+		return DefWindowProc(hwnd, msg, wParam, lParam);
 
 	// --- forward input to the offscreen browser -----------------------------
 	case WM_MOUSEMOVE:

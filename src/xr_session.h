@@ -28,6 +28,7 @@
 extern bool g_hasWeaveExt;
 extern PFN_xrWeaveBindWindowEXT g_pfnWeaveBindWindow;
 extern PFN_xrWeaveSubmitEXT g_pfnWeaveSubmit;
+extern PFN_xrWeaveSnapWindowRectEXT g_pfnWeaveSnapWindowRect; // #625 window-drag phase lock (may be NULL on an older runtime)
 
 // Initialize OpenXR instance + system; detect/enable D3D11 + win32_window_binding
 // + display_info + weave.
