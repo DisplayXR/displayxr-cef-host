@@ -40,6 +40,7 @@
 #include <dxgi1_3.h>
 #include <dcomp.h>
 #include <wrl/client.h>
+#include <windowsx.h> // GET_X_LPARAM / GET_Y_LPARAM
 
 #include <cstdint>
 #include <cstdio>
@@ -69,25 +70,160 @@ static ComPtr<IDCompositionTarget> g_dcompTarget;
 static ComPtr<IDCompositionVisual> g_dcompVisual;
 static ComPtr<IDXGISwapChain1> g_swapChain;
 
+// Shared with WndProc so we can render one frame inside the modal move/resize
+// loop (the WM_PAINT trick) and forward input to the offscreen browser.
+static XrSessionManager *g_xr = nullptr;
+static WeaveCompositor *g_comp = nullptr;
+static HostBridge *g_bridge = nullptr;
+static CefHostClient *g_client = nullptr; // lifetime held by a CefRefPtr in wWinMain
+static bool g_frameReady = false;         // setup complete — safe to render frames
+static bool g_isMoving = false;           // inside a modal move/resize loop
+static double g_latSum = 0.0;
+static uint32_t g_latCount = 0;
+static uint64_t g_frameIdx = 0;
+
+static void MaybeDumpComposite();
+static void RunOneFrame();
+
+// Forward a wheel/move/click to the offscreen browser (OSR has no real HWND, so
+// the embedder must inject input). Coords are client/device px (dpr handled by
+// the page; device_scale_factor = 1 here).
+static int
+CefModsFromWParam(WPARAM w)
+{
+	int m = 0;
+	if (w & MK_CONTROL) m |= EVENTFLAG_CONTROL_DOWN;
+	if (w & MK_SHIFT) m |= EVENTFLAG_SHIFT_DOWN;
+	if (GetKeyState(VK_MENU) & 0x8000) m |= EVENTFLAG_ALT_DOWN;
+	if (w & MK_LBUTTON) m |= EVENTFLAG_LEFT_MOUSE_BUTTON;
+	if (w & MK_RBUTTON) m |= EVENTFLAG_RIGHT_MOUSE_BUTTON;
+	return m;
+}
+
 // ---- Win32 window -----------------------------------------------------------
+static CefRefPtr<CefBrowserHost>
+HostOf()
+{
+	if (g_client && g_client->GetBrowser()) {
+		return g_client->GetBrowser()->GetHost();
+	}
+	return nullptr;
+}
+
 static LRESULT CALLBACK
 WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	switch (msg) {
 	case WM_CLOSE: g_quit = true; return 0;
 	case WM_DESTROY: PostQuitMessage(0); return 0;
+
 	case WM_SIZE:
 		if (wParam != SIZE_MINIMIZED) {
 			g_resized = true;
 		}
 		return 0;
-	case WM_KEYDOWN:
-		if (wParam == VK_ESCAPE) {
-			g_quit = true;
+
+	// --- WM_PAINT trick: keep weaving during the modal move/resize loop ------
+	// Windows runs an internal loop inside DefWindowProc during a drag that
+	// blocks our frame loop. It still dispatches WM_PAINT, so we render one frame
+	// there and never validate the window — Windows keeps sending WM_PAINT, so
+	// the weave keeps flowing and re-snaps to the moving window position.
+	// (docs/reference/window-drag-rendering.md, app-owned-window case.)
+	case WM_ENTERSIZEMOVE:
+		g_isMoving = true;
+		InvalidateRect(hwnd, nullptr, FALSE);
+		return 0;
+	case WM_EXITSIZEMOVE:
+		g_isMoving = false;
+		return 0;
+	case WM_PAINT:
+		if (g_isMoving && g_frameReady) {
+			RunOneFrame();           // render inline; do NOT Begin/EndPaint
+			InvalidateRect(hwnd, nullptr, FALSE); // stay invalid → next WM_PAINT
+			return 0;
+		}
+		break; // not dragging → let DefWindowProc validate
+
+	// --- forward input to the offscreen browser -----------------------------
+	case WM_MOUSEMOVE:
+		if (auto h = HostOf()) {
+			CefMouseEvent ev;
+			ev.x = GET_X_LPARAM(lParam);
+			ev.y = GET_Y_LPARAM(lParam);
+			ev.modifiers = CefModsFromWParam(wParam);
+			h->SendMouseMoveEvent(ev, false);
 		}
 		return 0;
+	case WM_MOUSEWHEEL:
+		if (auto h = HostOf()) {
+			POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)}; // screen coords
+			ScreenToClient(hwnd, &pt);
+			CefMouseEvent ev;
+			ev.x = pt.x;
+			ev.y = pt.y;
+			ev.modifiers = 0;
+			h->SendMouseWheelEvent(ev, 0, GET_WHEEL_DELTA_WPARAM(wParam));
+		}
+		return 0;
+	case WM_LBUTTONDOWN:
+	case WM_LBUTTONUP:
+	case WM_RBUTTONDOWN:
+	case WM_RBUTTONUP:
+		if (auto h = HostOf()) {
+			bool up = (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP);
+			bool right = (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP);
+			CefMouseEvent ev;
+			ev.x = GET_X_LPARAM(lParam);
+			ev.y = GET_Y_LPARAM(lParam);
+			ev.modifiers = CefModsFromWParam(wParam);
+			h->SendMouseClickEvent(ev, right ? MBT_RIGHT : MBT_LEFT, up, 1);
+			if (up) {
+				ReleaseCapture();
+			} else {
+				SetCapture(hwnd);
+				h->SetFocus(true);
+			}
+		}
+		return 0;
+	case WM_KEYDOWN:
+	case WM_KEYUP:
+	case WM_SYSKEYDOWN:
+	case WM_SYSKEYUP:
+	case WM_CHAR:
+		if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+			g_quit = true;
+			return 0;
+		}
+		if (auto h = HostOf()) {
+			CefKeyEvent ke;
+			ke.windows_key_code = (int)wParam;
+			ke.native_key_code = (int)lParam;
+			ke.is_system_key = (msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP);
+			int mods = 0;
+			if (GetKeyState(VK_CONTROL) & 0x8000) mods |= EVENTFLAG_CONTROL_DOWN;
+			if (GetKeyState(VK_SHIFT) & 0x8000) mods |= EVENTFLAG_SHIFT_DOWN;
+			if (GetKeyState(VK_MENU) & 0x8000) mods |= EVENTFLAG_ALT_DOWN;
+			ke.modifiers = mods;
+			ke.type = (msg == WM_CHAR) ? KEYEVENT_CHAR
+			          : (msg == WM_KEYUP || msg == WM_SYSKEYUP) ? KEYEVENT_KEYUP
+			                                                    : KEYEVENT_RAWKEYDOWN;
+			h->SendKeyEvent(ke);
+		}
+		return 0;
+	case WM_SETFOCUS:
+		if (auto h = HostOf()) {
+			h->SetFocus(true);
+		}
+		return 0;
+	case WM_KILLFOCUS:
+		if (auto h = HostOf()) {
+			h->SetFocus(false);
+		}
+		return 0;
+
 	default: return DefWindowProc(hwnd, msg, wParam, lParam);
 	}
+	return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 static bool
@@ -299,6 +435,59 @@ DemoPageUrl()
 	return std::string("file:///") + path;
 }
 
+// ---- One frame: pump CEF, handle resize, weave, composite, present ----------
+// Callable from the main loop AND from the WM_PAINT handler during a modal
+// move/resize (the WM_PAINT trick keeps the weave flowing while dragging).
+static void
+RunOneFrame()
+{
+	if (!g_frameReady || !g_xr || !g_comp || !g_bridge || !g_swapChain) {
+		return;
+	}
+	PollEvents(*g_xr);
+	CefDoMessageLoopWork(); // OnAcceleratedPaint / OnQuery fire here
+
+	if (g_resized) {
+		g_resized = false;
+		RECT rc = {};
+		GetClientRect(g_hwnd, &rc);
+		uint32_t cw = (uint32_t)(rc.right - rc.left), ch = (uint32_t)(rc.bottom - rc.top);
+		if (cw > 0 && ch > 0 && (cw != g_clientW || ch != g_clientH)) {
+			g_clientW = cw;
+			g_clientH = ch;
+			g_swapChain->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+			g_comp->OnResize();
+			if (g_client) {
+				g_client->SetViewSize(cw, ch);
+				if (g_client->GetBrowser()) {
+					g_client->GetBrowser()->GetHost()->WasResized();
+				}
+			}
+		}
+	}
+
+	double ms = 0.0;
+	if (g_comp->Frame(g_xr->session, g_swapChain.Get(), g_clientW, g_clientH, *g_bridge, &ms)) {
+		MaybeDumpComposite();
+		g_swapChain->Present(1, 0);
+		if (g_dcompDevice) {
+			g_dcompDevice->Commit();
+		}
+		DeliverEyesToPage(*g_bridge); // page renders next frame off-axis
+		g_latSum += ms;
+		g_latCount++;
+		if ((g_frameIdx % 120) == 0 && g_latCount > 0) {
+			LOG_INFO("weave round-trip: last=%.3f ms avg=%.3f ms (%u) rect=%d,%d %ux%u "
+			         "eyes(valid=%d track=%d n=%u L.x=%.4f R.x=%.4f) pageFrame=%llu",
+			         ms, g_latSum / g_latCount, g_latCount, g_bridge->rectX, g_bridge->rectY, g_bridge->rectW,
+			         g_bridge->rectH, g_bridge->eyesValid, g_bridge->eyesTracking, g_bridge->eyeCount,
+			         g_bridge->eyes[0], g_bridge->eyeCount >= 2 ? g_bridge->eyes[3] : 0.0f,
+			         (unsigned long long)g_bridge->pageFrame);
+		}
+		g_frameIdx++;
+	}
+}
+
 // -----------------------------------------------------------------------------
 int WINAPI
 wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
@@ -409,58 +598,29 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		return 1;
 	}
 
+	// Publish state for WndProc (WM_PAINT trick + input forwarding) and go.
+	g_xr = &xr;
+	g_comp = &compositor;
+	g_bridge = &bridge;
+	g_client = client.get();
+	g_frameReady = true;
+	if (client->GetBrowser()) {
+		client->GetBrowser()->GetHost()->SetFocus(true);
+	}
+
 	LOG_INFO("Entering weave loop (ESC / close to quit)...");
-	double latSum = 0.0;
-	uint32_t latCount = 0;
-	uint64_t frame = 0;
 	while (!g_quit && !xr.exitRequested && !bridge.browserClosed) {
 		MSG msg;
 		while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
 			DispatchMessage(&msg);
 		}
-		PollEvents(xr);
-		CefDoMessageLoopWork(); // drives CEF; OnAcceleratedPaint / OnQuery fire here
-
-		if (g_resized) {
-			g_resized = false;
-			RECT rc = {};
-			GetClientRect(g_hwnd, &rc);
-			uint32_t cw = (uint32_t)(rc.right - rc.left), ch = (uint32_t)(rc.bottom - rc.top);
-			if (cw > 0 && ch > 0 && (cw != g_clientW || ch != g_clientH)) {
-				g_clientW = cw;
-				g_clientH = ch;
-				g_swapChain->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
-				compositor.OnResize();
-				client->SetViewSize(cw, ch);
-				if (client->GetBrowser()) {
-					client->GetBrowser()->GetHost()->WasResized();
-				}
-			}
-		}
-
-		double ms = 0.0;
-		if (compositor.Frame(xr.session, g_swapChain.Get(), g_clientW, g_clientH, bridge, &ms)) {
-			MaybeDumpComposite();
-			g_swapChain->Present(1, 0);
-			if (g_dcompDevice) {
-				g_dcompDevice->Commit();
-			}
-			DeliverEyesToPage(bridge); // page renders next frame off-axis
-			latSum += ms;
-			latCount++;
-			if ((frame % 120) == 0 && latCount > 0) {
-				LOG_INFO("weave round-trip: last=%.3f ms avg=%.3f ms (%u) rect=%d,%d %ux%u "
-				         "eyes(valid=%d track=%d n=%u L.x=%.4f R.x=%.4f) pageFrame=%llu",
-				         ms, latSum / latCount, latCount, bridge.rectX, bridge.rectY, bridge.rectW, bridge.rectH,
-				         bridge.eyesValid, bridge.eyesTracking, bridge.eyeCount, bridge.eyes[0],
-				         bridge.eyeCount >= 2 ? bridge.eyes[3] : 0.0f, (unsigned long long)bridge.pageFrame);
-			}
-			frame++;
-		} else {
+		RunOneFrame();
+		if (!bridge.pageTex || !bridge.haveRect) {
 			Sleep(2); // no page texture / rect yet — don't busy-spin
 		}
 	}
+	g_frameReady = false;
 
 	// Teardown: close the browser, pump until it's gone, then shut CEF + XR down.
 	if (client && client->GetBrowser()) {
@@ -470,8 +630,9 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			Sleep(5);
 		}
 	}
-	if (latCount > 0) {
-		LOG_INFO("=== weave host done: %u frames, avg round-trip %.3f ms ===", latCount, latSum / latCount);
+	g_client = nullptr;
+	if (g_latCount > 0) {
+		LOG_INFO("=== weave host done: %u frames, avg round-trip %.3f ms ===", g_latCount, g_latSum / g_latCount);
 	}
 	CleanupOpenXR(xr);
 	CefShutdown();
