@@ -73,6 +73,7 @@ static HostBridge *g_bridge = nullptr;
 static CefHostClient *g_client = nullptr; // lifetime held by a CefRefPtr in wWinMain
 static bool g_frameReady = false;         // setup complete — safe to render frames
 static bool g_isMoving = false;           // inside a modal move/resize loop
+static const UINT_PTR kMoveTimerId = 1;   // fires inside the modal loop to render
 static double g_latSum = 0.0;
 static uint32_t g_latCount = 0;
 static uint64_t g_frameIdx = 0;
@@ -131,18 +132,26 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	// (docs/reference/window-drag-rendering.md, app-owned-window case.)
 	case WM_ENTERSIZEMOVE:
 		g_isMoving = true;
+		// A timer fires reliably inside the modal move/resize loop (WM_PAINT is
+		// starved during a fast drag of a DWM-composited swapchain window). It
+		// drives one weave+present per tick so the 3D re-snaps to the moving
+		// window position. ~8 ms ≈ 120 Hz.
+		SetTimer(hwnd, kMoveTimerId, 8, nullptr);
 		InvalidateRect(hwnd, nullptr, FALSE);
 		return 0;
 	case WM_EXITSIZEMOVE:
 		g_isMoving = false;
+		KillTimer(hwnd, kMoveTimerId);
 		return 0;
-	case WM_PAINT:
-		if (g_isMoving && g_frameReady) {
-			RunOneFrame(false);      // re-weave cached page; NO CEF pump (recurses)
-			InvalidateRect(hwnd, nullptr, FALSE); // stay invalid → next WM_PAINT
+	case WM_TIMER:
+		// Sole render source inside the modal move/resize loop. Present(1,0) inside
+		// the handler keeps the window position stable across weave→present, so the
+		// 3D phase matches what is shown; ~8 ms timer coalesces to vsync.
+		if (wParam == kMoveTimerId && g_isMoving && g_frameReady) {
+			RunOneFrame(false); // re-weave cached page at new window pos; NO CEF pump
 			return 0;
 		}
-		break; // not dragging → let DefWindowProc validate
+		break;
 
 	// --- forward input to the offscreen browser -----------------------------
 	case WM_MOUSEMOVE:
@@ -464,7 +473,17 @@ RunOneFrame(bool pumpCef)
 	}
 
 	double ms = 0.0;
-	if (g_comp->Frame(g_xr->session, g_swapChain.Get(), g_clientW, g_clientH, *g_bridge, &ms)) {
+	bool wove = g_comp->Frame(g_xr->session, g_swapChain.Get(), g_clientW, g_clientH, *g_bridge, &ms);
+	if (!pumpCef) {
+		// Diagnostic for the modal-drag path: confirm frames flow + weave succeeds.
+		static uint32_t mv = 0;
+		if ((mv++ % 30) == 0) {
+			RECT wr = {};
+			GetWindowRect(g_hwnd, &wr);
+			LOG_INFO("MOVE-frame %u: win=(%d,%d) wove=%d last=%.3f ms", mv, wr.left, wr.top, wove ? 1 : 0, ms);
+		}
+	}
+	if (wove) {
 		MaybeDumpComposite();
 		g_swapChain->Present(1, 0);
 		DeliverEyesToPage(*g_bridge); // page renders next frame off-axis
