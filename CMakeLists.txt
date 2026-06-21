@@ -142,7 +142,7 @@ target_link_libraries(displayxr_cef_host PRIVATE
     ${CEF_STANDARD_LIBS}
     displayxr::common
     OpenXR::openxr_loader
-    d3d11 dxgi dcomp d3dcompiler)
+    d3d11 dxgi d3dcompiler)
 
 # Embed our DPI / asInvoker manifest (relative path dodges spaces-in-path).
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/host.manifest"

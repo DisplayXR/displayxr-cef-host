@@ -38,7 +38,6 @@
 
 #include <d3d11_4.h>
 #include <dxgi1_3.h>
-#include <dcomp.h>
 #include <wrl/client.h>
 #include <windowsx.h> // GET_X_LPARAM / GET_Y_LPARAM
 
@@ -49,7 +48,6 @@
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "dcomp.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -65,9 +63,6 @@ static uint32_t g_clientW = kWinW, g_clientH = kWinH;
 
 static ComPtr<ID3D11Device5> g_device;
 static ComPtr<ID3D11DeviceContext4> g_context;
-static ComPtr<IDCompositionDevice> g_dcompDevice;
-static ComPtr<IDCompositionTarget> g_dcompTarget;
-static ComPtr<IDCompositionVisual> g_dcompVisual;
 static ComPtr<IDXGISwapChain1> g_swapChain;
 
 // Shared with WndProc so we can render one frame inside the modal move/resize
@@ -242,11 +237,13 @@ CreateAppWindow(HINSTANCE hInst)
 	RegisterClassExW(&wc);
 
 	RECT r = {0, 0, (LONG)kWinW, (LONG)kWinH};
-	AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_NOREDIRECTIONBITMAP);
-	// WS_EX_NOREDIRECTIONBITMAP: required for a DComp-presented (alpha) window.
-	g_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, wc.lpszClassName, L"DisplayXR CEF Weave Host (#625)",
-	                         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top,
-	                         nullptr, nullptr, hInst, nullptr);
+	AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
+	// Plain opaque window — the page fills it, so no transparency / DComp needed.
+	// A flip-model HWND swapchain (below) stays position-synced with the window
+	// during drag, which DComp's async Commit does not.
+	g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"DisplayXR CEF Weave Host (#625)", WS_OVERLAPPEDWINDOW,
+	                         CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr, nullptr,
+	                         hInst, nullptr);
 	if (!g_hwnd) {
 		LOG_ERROR("CreateWindowEx failed: %lu", GetLastError());
 		return false;
@@ -294,9 +291,14 @@ CreateDeviceOnAdapter(LUID luid)
 	return true;
 }
 
-// ---- DirectComposition transparent swap chain (caller-owned present) ---------
+// ---- Flip-model HWND swap chain (caller-owned, opaque present) ---------------
+// A flip-model swapchain bound directly to the HWND stays position-synced with
+// the window during a drag (DWM presents it in lockstep with the window), so the
+// weave phase (derived from the window position at weave time) matches what is
+// shown — unlike DirectComposition, whose async Commit lands a frame after the
+// window has already moved (3D collapse / stutter during drag).
 static bool
-CreateCompositionSwapChain(uint32_t w, uint32_t h)
+CreateHwndSwapChain(uint32_t w, uint32_t h)
 {
 	ComPtr<IDXGIDevice> dxgiDevice;
 	g_device.As(&dxgiDevice);
@@ -312,29 +314,15 @@ CreateCompositionSwapChain(uint32_t w, uint32_t h)
 	sd.SampleDesc.Count = 1;
 	sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 	sd.BufferCount = 2;
-	sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-	sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-	HRESULT hr = factory->CreateSwapChainForComposition(g_device.Get(), &sd, nullptr, &g_swapChain);
+	sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+	HRESULT hr = factory->CreateSwapChainForHwnd(g_device.Get(), g_hwnd, &sd, nullptr, nullptr, &g_swapChain);
 	if (FAILED(hr)) {
-		LOG_ERROR("CreateSwapChainForComposition failed: 0x%08lx", hr);
+		LOG_ERROR("CreateSwapChainForHwnd failed: 0x%08lx", hr);
 		return false;
 	}
-	if (!g_dcompDevice) {
-		hr = DCompositionCreateDevice(dxgiDevice.Get(), IID_PPV_ARGS(&g_dcompDevice));
-		if (FAILED(hr)) {
-			LOG_ERROR("DCompositionCreateDevice failed: 0x%08lx", hr);
-			return false;
-		}
-		hr = g_dcompDevice->CreateTargetForHwnd(g_hwnd, TRUE, &g_dcompTarget);
-		if (FAILED(hr)) {
-			LOG_ERROR("CreateTargetForHwnd failed: 0x%08lx", hr);
-			return false;
-		}
-		g_dcompDevice->CreateVisual(&g_dcompVisual);
-	}
-	g_dcompVisual->SetContent(g_swapChain.Get());
-	g_dcompTarget->SetRoot(g_dcompVisual.Get());
-	g_dcompDevice->Commit();
+	// We own the present; suppress DXGI's Alt+Enter fullscreen handling.
+	factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER);
 	return true;
 }
 
@@ -479,9 +467,6 @@ RunOneFrame(bool pumpCef)
 	if (g_comp->Frame(g_xr->session, g_swapChain.Get(), g_clientW, g_clientH, *g_bridge, &ms)) {
 		MaybeDumpComposite();
 		g_swapChain->Present(1, 0);
-		if (g_dcompDevice) {
-			g_dcompDevice->Commit();
-		}
 		DeliverEyesToPage(*g_bridge); // page renders next frame off-axis
 		g_latSum += ms;
 		g_latCount++;
@@ -545,7 +530,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		if (!CreateDeviceOnAdapter(luid)) {
 			break;
 		}
-		if (!CreateCompositionSwapChain(g_clientW, g_clientH)) {
+		if (!CreateHwndSwapChain(g_clientW, g_clientH)) {
 			break;
 		}
 		if (!CreateSession(xr, g_device.Get(), g_hwnd)) {
