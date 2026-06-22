@@ -523,11 +523,11 @@ RunOneFrame()
 		g_latSum += ms;
 		g_latCount++;
 		if ((g_frameIdx % 120) == 0 && g_latCount > 0) {
-			LOG_INFO("weave round-trip: last=%.3f ms avg=%.3f ms (%u) rect=%d,%d %ux%u "
+			LOG_INFO("weave round-trip: last=%.3f ms avg=%.3f ms (%u) elements=%zu "
 			         "eyes(valid=%d track=%d n=%u L.x=%.4f R.x=%.4f) pageFrame=%llu mv=%d",
-			         ms, g_latSum / g_latCount, g_latCount, g_bridge->rectX, g_bridge->rectY, g_bridge->rectW,
-			         g_bridge->rectH, g_bridge->eyesValid, g_bridge->eyesTracking, g_bridge->eyeCount,
-			         g_bridge->eyes[0], g_bridge->eyeCount >= 2 ? g_bridge->eyes[3] : 0.0f,
+			         ms, g_latSum / g_latCount, g_latCount, g_bridge->elements.size(), g_bridge->eyesValid,
+			         g_bridge->eyesTracking, g_bridge->eyeCount, g_bridge->eyes[0],
+			         g_bridge->eyeCount >= 2 ? g_bridge->eyes[3] : 0.0f,
 			         (unsigned long long)g_bridge->pageFrame, g_isMoving ? 1 : 0);
 		}
 		g_frameIdx++;
@@ -663,8 +663,8 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			DispatchMessage(&msg);
 		}
 		RunOneFrame();
-		if (!bridge.pageTex || !bridge.haveRect) {
-			Sleep(2); // no page texture / rect yet — don't busy-spin
+		if (!bridge.pageTex || bridge.elements.empty()) {
+			Sleep(2); // no page texture / element rects yet — don't busy-spin
 		}
 	}
 	g_frameReady = false;

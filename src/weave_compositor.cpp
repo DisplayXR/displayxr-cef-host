@@ -225,93 +225,12 @@ WeaveCompositor::Frame(XrSession session,
                        HostBridge &bridge,
                        double *outMs)
 {
-	if (!bridge.pageTex || !bridge.haveRect || winW == 0 || winH == 0) {
+	if (!bridge.pageTex || bridge.elements.empty() || winW == 0 || winH == 0) {
 		return false;
 	}
 
-	// Clamp the element rect to the page texture + window.
-	int32_t rx = bridge.rectX, ry = bridge.rectY;
-	int32_t rw = (int32_t)bridge.rectW, rh = (int32_t)bridge.rectH;
-	rx = std::max(0, std::min(rx, (int32_t)bridge.pageW - 1));
-	ry = std::max(0, std::min(ry, (int32_t)bridge.pageH - 1));
-	rw = std::max(1, std::min(rw, (int32_t)bridge.pageW - rx));
-	rh = std::max(1, std::min(rh, (int32_t)bridge.pageH - ry));
-
-	if (!EnsureSbsInput((uint32_t)rw, (uint32_t)rh)) {
-		return false;
-	}
-
-	// Extract the element sub-rect (the pre-weave SBS pair) into the keyed-mutex
-	// input texture. key 0 = "caller done writing, runtime may read" — release
-	// BEFORE xrWeaveSubmitEXT or the service's same-key acquire would block.
-	if (sbs_mutex_->AcquireSync(0, 1000) != S_OK) {
-		return false;
-	}
-	D3D11_BOX box = {};
-	box.left = (UINT)rx;
-	box.top = (UINT)ry;
-	box.front = 0;
-	box.right = (UINT)(rx + rw);
-	box.bottom = (UINT)(ry + rh);
-	box.back = 1;
-	context_->CopySubresourceRegion(sbs_.Get(), 0, 0, 0, 0, bridge.pageTex.Get(), 0, &box);
-	context_->Flush();
-	sbs_mutex_->ReleaseSync(0);
-
-	// Drive the weave RPC.
-	XrWeaveSubmitInfoEXT in = {XR_TYPE_WEAVE_SUBMIT_INFO_EXT};
-	in.inputTexture = (void *)sbs_handle_;
-	in.inputIsDxgi = XR_FALSE;
-	in.rect.offset.x = rx;
-	in.rect.offset.y = ry;
-	in.rect.extent.width = rw;
-	in.rect.extent.height = rh;
-
-	XrWeaveOutputEXT out = {XR_TYPE_WEAVE_OUTPUT_EXT};
-	LARGE_INTEGER f, t0, t1;
-	QueryPerformanceFrequency(&f);
-	QueryPerformanceCounter(&t0);
-	XrResult sr = g_pfnWeaveSubmit(session, &in, &out);
-	QueryPerformanceCounter(&t1);
-	if (XR_FAILED(sr)) {
-		LogXrResult("xrWeaveSubmitEXT", sr);
-		return false;
-	}
-	if (outMs) {
-		*outMs = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
-	}
-
-	// Returned eyes -> bridge (delivered to the page for off-axis render).
-	if (out.eyesValid == XR_TRUE && out.eyeCount > 0) {
-		uint32_t n = out.eyeCount > kHostMaxEyes ? kHostMaxEyes : out.eyeCount;
-		for (uint32_t i = 0; i < n; i++) {
-			bridge.eyes[i * 3 + 0] = out.eyes[i].x;
-			bridge.eyes[i * 3 + 1] = out.eyes[i].y;
-			bridge.eyes[i * 3 + 2] = out.eyes[i].z;
-		}
-		bridge.eyeCount = n;
-		bridge.eyesValid = true;
-		bridge.eyesTracking = (out.eyesTracking == XR_TRUE);
-	}
-
-	// Open the weaved handback on the first frame / on re-allocation.
-	if (!have_handback_ || out.weavedTexture != nullptr) {
-		if (!OpenHandback(out)) {
-			return false;
-		}
-		have_handback_ = true;
-	}
-	if (!weaved_ || !weaved_srv_) {
-		return false;
-	}
-
-	// GPU-wait the runtime's weave-complete signal, then make an SRV-able copy.
-	if (fence_) {
-		context_->Wait(fence_.Get(), out.fenceValue);
-	}
-	context_->CopyResource(weaved_srv_tex_.Get(), weaved_.Get());
-
-	// Composite into the swap-chain back buffer: page (base) + weaved sub-rect.
+	// Back buffer + page SRV + render state — set up once; the page base and all
+	// woven element sub-rects composite into the same back buffer.
 	ComPtr<ID3D11Texture2D> back;
 	if (FAILED(swapchain->GetBuffer(0, IID_PPV_ARGS(&back)))) {
 		return false;
@@ -324,29 +243,126 @@ WeaveCompositor::Frame(XrSession session,
 	if (FAILED(device_->CreateShaderResourceView(bridge.pageTex.Get(), nullptr, &pageSrv))) {
 		return false;
 	}
-
 	ID3D11RenderTargetView *rtvs[1] = {rtv.Get()};
 	context_->OMSetRenderTargets(1, rtvs, nullptr);
 	float bf[4] = {1, 1, 1, 1};
 	context_->OMSetBlendState(blend_.Get(), bf, 0xffffffff);
 	D3D11_VIEWPORT vp = {0.0f, 0.0f, (float)winW, (float)winH, 0.0f, 1.0f};
 	context_->RSSetViewports(1, &vp);
+	ID3D11ShaderResourceView *nullSrv[1] = {nullptr};
 
-	// Page base (full window).
+	// Page base (full window): the 2D surround + each element's flat SBS pixels,
+	// the latter replaced by the woven 3D below.
 	BlitQuad(pageSrv.Get(), 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f);
 
-	// Weaved sub-rect over the element rect (replaces the flat canvas).
-	float dstx = (float)rx / (float)winW;
-	float dsty = (float)ry / (float)winH;
-	float dstw = (float)rw / (float)winW;
-	float dsth = (float)rh / (float)winH;
-	float wsw = weaved_w_ ? (float)weaved_w_ : (float)winW;
-	float wsh = weaved_h_ ? (float)weaved_h_ : (float)winH;
-	BlitQuad(weaved_srv_.Get(), dstx, dsty, dstw, dsth, (float)rx / wsw, (float)ry / wsh, (float)rw / wsw,
-	         (float)rh / wsh);
+	// Weave each inline-3D element. Serialized per element (submit → wait → copy
+	// → blit) so it is robust whether or not the DP preserves prior sub-rects
+	// across submits into the same window-sized output texture — each element's
+	// woven sub-rect is captured before the next submit can overwrite the shared
+	// output. N is small (one per `.element3d`). The returned eyes are the
+	// VIEWER's (global, identical for every element).
+	double totalMs = 0.0;
+	uint32_t wove = 0;
+	for (const Element3D &el : bridge.elements) {
+		// Clamp this element's rect to the page texture + window.
+		int32_t rx = el.x, ry = el.y;
+		int32_t rw = (int32_t)el.w, rh = (int32_t)el.h;
+		rx = std::max(0, std::min(rx, (int32_t)bridge.pageW - 1));
+		ry = std::max(0, std::min(ry, (int32_t)bridge.pageH - 1));
+		rw = std::max(1, std::min(rw, (int32_t)bridge.pageW - rx));
+		rh = std::max(1, std::min(rh, (int32_t)bridge.pageH - ry));
+
+		if (!EnsureSbsInput((uint32_t)rw, (uint32_t)rh)) {
+			continue;
+		}
+
+		// Extract the element sub-rect (the pre-weave SBS pair) into the
+		// keyed-mutex input texture. key 0 = "caller done writing, runtime may
+		// read" — release BEFORE xrWeaveSubmitEXT or the service's same-key
+		// acquire would block. (pageTex is read here while also bound as the page
+		// SRV above — both reads, no hazard.)
+		if (sbs_mutex_->AcquireSync(0, 1000) != S_OK) {
+			continue;
+		}
+		D3D11_BOX box = {};
+		box.left = (UINT)rx;
+		box.top = (UINT)ry;
+		box.front = 0;
+		box.right = (UINT)(rx + rw);
+		box.bottom = (UINT)(ry + rh);
+		box.back = 1;
+		context_->CopySubresourceRegion(sbs_.Get(), 0, 0, 0, 0, bridge.pageTex.Get(), 0, &box);
+		context_->Flush();
+		sbs_mutex_->ReleaseSync(0);
+
+		XrWeaveSubmitInfoEXT in = {XR_TYPE_WEAVE_SUBMIT_INFO_EXT};
+		in.inputTexture = (void *)sbs_handle_;
+		in.inputIsDxgi = XR_FALSE;
+		in.rect.offset.x = rx;
+		in.rect.offset.y = ry;
+		in.rect.extent.width = rw;
+		in.rect.extent.height = rh;
+
+		XrWeaveOutputEXT out = {XR_TYPE_WEAVE_OUTPUT_EXT};
+		LARGE_INTEGER f, t0, t1;
+		QueryPerformanceFrequency(&f);
+		QueryPerformanceCounter(&t0);
+		XrResult sr = g_pfnWeaveSubmit(session, &in, &out);
+		QueryPerformanceCounter(&t1);
+		if (XR_FAILED(sr)) {
+			LogXrResult("xrWeaveSubmitEXT", sr);
+			continue;
+		}
+		totalMs += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+
+		// Returned eyes -> bridge (global; delivered to the page for off-axis
+		// render of every element).
+		if (out.eyesValid == XR_TRUE && out.eyeCount > 0) {
+			uint32_t n = out.eyeCount > kHostMaxEyes ? kHostMaxEyes : out.eyeCount;
+			for (uint32_t i = 0; i < n; i++) {
+				bridge.eyes[i * 3 + 0] = out.eyes[i].x;
+				bridge.eyes[i * 3 + 1] = out.eyes[i].y;
+				bridge.eyes[i * 3 + 2] = out.eyes[i].z;
+			}
+			bridge.eyeCount = n;
+			bridge.eyesValid = true;
+			bridge.eyesTracking = (out.eyesTracking == XR_TRUE);
+		}
+
+		// Open the weaved handback on the first frame / on re-allocation.
+		if (!have_handback_ || out.weavedTexture != nullptr) {
+			if (!OpenHandback(out)) {
+				continue;
+			}
+			have_handback_ = true;
+		}
+		if (!weaved_ || !weaved_srv_) {
+			continue;
+		}
+
+		// GPU-wait this element's weave, capture an SRV-able copy BEFORE the next
+		// submit can overwrite the shared output, then composite its sub-rect.
+		if (fence_) {
+			context_->Wait(fence_.Get(), out.fenceValue);
+		}
+		context_->PSSetShaderResources(0, 1, nullSrv); // unbind: copy writes the SRV's resource
+		context_->CopyResource(weaved_srv_tex_.Get(), weaved_.Get());
+
+		float dstx = (float)rx / (float)winW;
+		float dsty = (float)ry / (float)winH;
+		float dstw = (float)rw / (float)winW;
+		float dsth = (float)rh / (float)winH;
+		float wsw = weaved_w_ ? (float)weaved_w_ : (float)winW;
+		float wsh = weaved_h_ ? (float)weaved_h_ : (float)winH;
+		BlitQuad(weaved_srv_.Get(), dstx, dsty, dstw, dsth, (float)rx / wsw, (float)ry / wsh,
+		         (float)rw / wsw, (float)rh / wsh);
+		wove++;
+	}
 
 	// Unbind the SRV (defensive; the targets are released next frame anyway).
-	ID3D11ShaderResourceView *nullSrv[1] = {nullptr};
 	context_->PSSetShaderResources(0, 1, nullSrv);
-	return true;
+	if (outMs) {
+		*outMs = totalMs;
+	}
+	return wove > 0;
 }

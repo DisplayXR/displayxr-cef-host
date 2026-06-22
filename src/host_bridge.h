@@ -17,11 +17,20 @@
 #include <d3d11_4.h>
 #include <wrl/client.h>
 #include <cstdint>
+#include <vector>
 
 #include "include/wrapper/cef_message_router.h"
 
 //! Mirrors XR_WEAVE_MAX_EYES_EXT (kept local so this header has no OpenXR dep).
 static const uint32_t kHostMaxEyes = 8;
+
+//! One inline-3D element's committed device-pixel rect within the window client
+//! area (y-down). The DOM drives the SET of 3D regions (#625 multi-element):
+//! one of these per `.element3d` canvas, refreshed every frame from the page.
+struct Element3D {
+	int32_t x = 0, y = 0;
+	uint32_t w = 0, h = 0;
+};
 
 //! The single shared bridge between CEF (content + page messages) and the weave
 //! loop. Created once in main and handed to the CEF client.
@@ -39,12 +48,12 @@ struct HostBridge {
 	uint32_t pageH = 0;
 	uint64_t pageFrame = 0; //!< increments on every accelerated paint
 
-	// --- 3D element rect reported by the page (written by OnQuery) -----------
-	// Committed device-pixel rect within the window client area (y-down).
-	int32_t rectX = 0, rectY = 0;
-	uint32_t rectW = 0, rectH = 0;
-	bool haveRect = false;
-	uint64_t rectSeq = 0; //!< increments on every rect update
+	// --- 3D element rects reported by the page (written by OnQuery) ----------
+	// The page posts the full list every frame ("rects <n> x0 y0 w0 h0 ...");
+	// OnQuery replaces this wholesale, so removing a `.element3d` from the DOM
+	// simply drops it from the next list (no stale-element bookkeeping).
+	std::vector<Element3D> elements;
+	uint64_t rectSeq = 0; //!< increments on every rect-list update
 
 	// --- Eyes-down channel ---------------------------------------------------
 	// The persistent cefQuery callback the page registered to receive eyes.

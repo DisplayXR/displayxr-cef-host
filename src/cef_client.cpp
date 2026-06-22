@@ -153,15 +153,31 @@ CefHostClient::OnQuery(CefRefPtr<CefBrowser> browser,
 		return true; // keep the persistent query open; do NOT Success() now
 	}
 
-	// Rect-up: "rect <x> <y> <w> <h>" in device px, window-relative, y-down.
-	if (req.rfind("rect ", 0) == 0) {
-		int x = 0, y = 0, w = 0, hgt = 0;
-		if (sscanf_s(req.c_str(), "rect %d %d %d %d", &x, &y, &w, &hgt) == 4 && w > 0 && hgt > 0) {
-			bridge_->rectX = x;
-			bridge_->rectY = y;
-			bridge_->rectW = (uint32_t)w;
-			bridge_->rectH = (uint32_t)hgt;
-			bridge_->haveRect = true;
+	// Rects-up (#625 multi-element): "rects <n> x0 y0 w0 h0 x1 y1 w1 h1 ..." in
+	// device px, window-relative, y-down. The page posts the FULL list each
+	// frame; we replace bridge_->elements wholesale (so a removed `.element3d`
+	// just disappears from the next list). One element ⟹ "rects 1 x y w h".
+	if (req.rfind("rects ", 0) == 0) {
+		std::vector<Element3D> elems;
+		int n = 0, consumed = 0;
+		if (sscanf_s(req.c_str(), "rects %d%n", &n, &consumed) == 1 && n >= 0) {
+			const char *p = req.c_str() + consumed;
+			for (int i = 0; i < n; i++) {
+				int x = 0, y = 0, w = 0, hgt = 0, adv = 0;
+				if (sscanf_s(p, " %d %d %d %d%n", &x, &y, &w, &hgt, &adv) != 4) {
+					break; // malformed — keep whatever parsed cleanly
+				}
+				p += adv;
+				if (w > 0 && hgt > 0) {
+					Element3D e;
+					e.x = x;
+					e.y = y;
+					e.w = (uint32_t)w;
+					e.h = (uint32_t)hgt;
+					elems.push_back(e);
+				}
+			}
+			bridge_->elements.swap(elems);
 			bridge_->rectSeq++;
 		}
 		callback->Success("ok");

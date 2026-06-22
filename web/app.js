@@ -1,15 +1,17 @@
 // Copyright 2026, DisplayXR — SPDX-License-Identifier: BSL-1.0
-// Demo page logic for the CEF OSR weave host (#625, Step A).
+// Demo page logic for the CEF OSR weave host (#625, Step A — multi-element).
 //
-// Renders ONE 3D element as a side-by-side stereo pair (left half = left eye,
-// right half = right eye) using off-axis asymmetric-frustum (Kooima) projection
-// driven by the eyes the host feeds back. Reports the element's committed
-// device-pixel rect to the host each frame, and subscribes to the host's eyes.
+// Renders EACH `.element3d` canvas as a side-by-side stereo pair (left half =
+// left eye, right half = right eye) using off-axis asymmetric-frustum (Kooima)
+// projection driven by the eyes the host feeds back. Reports ALL elements'
+// committed device-pixel rects to the host each frame ("rects <n> ..."), and
+// subscribes to the host's tracked eyes (one viewer, shared by every element).
 //
-// The host extracts this canvas's device-pixel rect from CEF's composited-page
-// texture as the PRE-WEAVE SBS input, drives the real weave RPC, and composites
-// the woven result back over the same rect — so the flat SBS the page draws here
-// is what gets replaced by true interlaced 3D on the display.
+// The host extracts each canvas's device-pixel rect from CEF's composited-page
+// texture as that element's PRE-WEAVE SBS input, drives the real weave RPC per
+// element, and composites each woven result back over its own rect — so the flat
+// SBS each canvas draws is replaced by true interlaced 3D on the display. Mixed
+// 2D/3D is therefore DOM-driven: add a `.element3d` → it's 3D; remove it → 2D.
 
 (function () {
   "use strict";
@@ -70,80 +72,105 @@
   function sh(gl, type, src) { const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
     if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; }
 
-  // ---- state -----------------------------------------------------------------
-  const canvas = document.getElementById("el3d");
+  // ---- shared state ----------------------------------------------------------
   const hud = document.getElementById("hud");
   const dpr = () => window.devicePixelRatio || 1;
   // Element physical size (notional, metres) for the Kooima screen rect.
   const SCREEN_W = 0.30;
   // Eyes (display-space metres). Default: 63 mm IPD, 0.5 m out, until tracking.
+  // ONE viewer — the same eyes drive every element's off-axis projection.
   let eyes = [ {x:-0.0315,y:0,z:0.5}, {x:0.0315,y:0,z:0.5} ];
   let eyesInfo = { valid:false, tracking:false };
 
-  const gl = canvas.getContext("webgl", { alpha:false, antialias:true, preserveDrawingBuffer:true });
-  if (!gl) { hud.textContent = "WebGL unavailable"; return; }
-
-  const prog = gl.createProgram();
-  gl.attachShader(prog, sh(gl, gl.VERTEX_SHADER, VS));
-  gl.attachShader(prog, sh(gl, gl.FRAGMENT_SHADER, FS));
-  gl.linkProgram(prog); gl.useProgram(prog);
-  const aPos = gl.getAttribLocation(prog,"aPos"), aNrm = gl.getAttribLocation(prog,"aNrm");
-  const uMVP = gl.getUniformLocation(prog,"uMVP"), uModel = gl.getUniformLocation(prog,"uModel"),
-        uColor = gl.getUniformLocation(prog,"uColor");
-  const geo = cube();
-  const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, geo.pos, gl.STATIC_DRAW);
-  gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
-  const nb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nb); gl.bufferData(gl.ARRAY_BUFFER, geo.nrm, gl.STATIC_DRAW);
-  gl.enableVertexAttribArray(aNrm); gl.vertexAttribPointer(aNrm,3,gl.FLOAT,false,0,0);
-  gl.enable(gl.DEPTH_TEST);
-
-  // Cubes: depth-staggered so 3D / look-around is unmistakable. (x,y,z, color)
-  const cubes = [
-    { p:[-0.06, 0.0,  0.045], c:[0.92,0.30,0.25], s:0.028 }, // red, in front of screen
-    { p:[ 0.0,  0.0,  0.0  ], c:[0.30,0.85,0.40], s:0.030 }, // green, at screen plane
-    { p:[ 0.07, 0.0, -0.06 ], c:[0.35,0.55,0.95], s:0.034 }, // blue, behind screen
+  // Per-element scene presets — visually distinct depths so multi-element 3D is
+  // unmistakable. Cycled across the `.element3d` canvases in DOM order.
+  const SCENES = [
+    [ // 3 depth-staggered cubes (front / at-plane / behind)
+      { p:[-0.06, 0.0,  0.045], c:[0.92,0.30,0.25], s:0.028 },
+      { p:[ 0.0,  0.0,  0.0  ], c:[0.30,0.85,0.40], s:0.030 },
+      { p:[ 0.07, 0.0, -0.06 ], c:[0.35,0.55,0.95], s:0.034 },
+    ],
+    [ // a single cube popping far out IN FRONT of the screen
+      { p:[ 0.0,  0.0,  0.09 ], c:[0.95,0.75,0.20], s:0.050 },
+    ],
+    [ // two cubes, one deep BEHIND the screen plane
+      { p:[-0.05, 0.0, -0.10 ], c:[0.65,0.40,0.95], s:0.040 },
+      { p:[ 0.05, 0.02, 0.02 ], c:[0.20,0.85,0.85], s:0.030 },
+    ],
   ];
 
-  function drawEye(eye, vx, vy, vw, vh, W, H, t) {
-    gl.viewport(vx, vy, vw, vh);
-    gl.enable(gl.SCISSOR_TEST); gl.scissor(vx, vy, vw, vh);
-    gl.clearColor(0.06,0.07,0.09,1.0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    const VP = M.frustumForEye(eye.x, eye.y, eye.z, W, H, 0.01, 10.0);
-    for (const cu of cubes) {
-      let model = M.mul(M.translate(cu.p[0], cu.p[1], cu.p[2]), M.mul(M.rotY(t*0.6), M.mul(M.rotX(t*0.4), M.scale(cu.s))));
-      gl.uniformMatrix4fv(uMVP, false, M.mul(VP, model));
-      gl.uniformMatrix4fv(uModel, false, model);
-      gl.uniform3fv(uColor, cu.c);
-      gl.drawArrays(gl.TRIANGLES, 0, geo.count);
+  // ---- per-canvas renderer ---------------------------------------------------
+  function makeRenderer(canvas, cubes) {
+    const gl = canvas.getContext("webgl", { alpha:false, antialias:true, preserveDrawingBuffer:true });
+    if (!gl) return null;
+    const prog = gl.createProgram();
+    gl.attachShader(prog, sh(gl, gl.VERTEX_SHADER, VS));
+    gl.attachShader(prog, sh(gl, gl.FRAGMENT_SHADER, FS));
+    gl.linkProgram(prog); gl.useProgram(prog);
+    const aPos = gl.getAttribLocation(prog,"aPos"), aNrm = gl.getAttribLocation(prog,"aNrm");
+    const uMVP = gl.getUniformLocation(prog,"uMVP"), uModel = gl.getUniformLocation(prog,"uModel"),
+          uColor = gl.getUniformLocation(prog,"uColor");
+    const geo = cube();
+    const pb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, pb); gl.bufferData(gl.ARRAY_BUFFER, geo.pos, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos,3,gl.FLOAT,false,0,0);
+    const nb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, nb); gl.bufferData(gl.ARRAY_BUFFER, geo.nrm, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(aNrm); gl.vertexAttribPointer(aNrm,3,gl.FLOAT,false,0,0);
+    gl.enable(gl.DEPTH_TEST);
+
+    function drawEye(eye, vx, vy, vw, vh, W, H, t) {
+      gl.viewport(vx, vy, vw, vh);
+      gl.enable(gl.SCISSOR_TEST); gl.scissor(vx, vy, vw, vh);
+      gl.clearColor(0.06,0.07,0.09,1.0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      const VP = M.frustumForEye(eye.x, eye.y, eye.z, W, H, 0.01, 10.0);
+      for (const cu of cubes) {
+        let model = M.mul(M.translate(cu.p[0], cu.p[1], cu.p[2]), M.mul(M.rotY(t*0.6), M.mul(M.rotX(t*0.4), M.scale(cu.s))));
+        gl.uniformMatrix4fv(uMVP, false, M.mul(VP, model));
+        gl.uniformMatrix4fv(uModel, false, model);
+        gl.uniform3fv(uColor, cu.c);
+        gl.drawArrays(gl.TRIANGLES, 0, geo.count);
+      }
+      gl.disable(gl.SCISSOR_TEST);
     }
-    gl.disable(gl.SCISSOR_TEST);
+
+    // Draw this element's SBS pair and return its committed device-px rect
+    // (window-relative, y-down) for the host to weave.
+    return function drawAndRect(t) {
+      const rect = canvas.getBoundingClientRect();
+      const scale = dpr();
+      const dw = Math.max(2, Math.round(rect.width * scale));
+      const dh = Math.max(2, Math.round(rect.height * scale));
+      if (canvas.width !== dw || canvas.height !== dh) { canvas.width = dw; canvas.height = dh; }
+      const H = SCREEN_W * (dh / dw);
+      const halfW = (dw / 2) | 0;
+      drawEye(eyes[0], 0,     0, halfW,      dh, SCREEN_W, H, t);
+      drawEye(eyes[1], halfW, 0, dw - halfW, dh, SCREEN_W, H, t);
+      return { x: Math.round(rect.left * scale), y: Math.round(rect.top * scale), w: dw, h: dh };
+    };
   }
+
+  // ---- discover elements + build renderers -----------------------------------
+  const canvases = Array.prototype.slice.call(document.querySelectorAll(".element3d"));
+  const renderers = canvases
+    .map((c, i) => makeRenderer(c, SCENES[i % SCENES.length]))
+    .filter(Boolean);
+  if (!renderers.length) { hud.textContent = "WebGL unavailable"; return; }
 
   function render(tms) {
     const t = tms * 0.001;
-    const rect = canvas.getBoundingClientRect();
-    const scale = dpr();
-    const dw = Math.max(2, Math.round(rect.width * scale));
-    const dh = Math.max(2, Math.round(rect.height * scale));
-    if (canvas.width !== dw || canvas.height !== dh) { canvas.width = dw; canvas.height = dh; }
-    const H = SCREEN_W * (dh / dw);
 
-    // Two halves: left eye in left half, right eye in right half. (GL viewport y
-    // is bottom-up; that's fine — both halves share full height.)
-    const halfW = (dw / 2) | 0;
-    drawEye(eyes[0], 0,      0, halfW,        dh, SCREEN_W, H, t);
-    drawEye(eyes[1], halfW,  0, dw - halfW,   dh, SCREEN_W, H, t);
+    // Draw every element + collect its committed rect.
+    const rects = [];
+    for (const draw of renderers) rects.push(draw(t));
 
-    // Report committed device-pixel rect (window-relative, y-down) to the host.
+    // Report ALL element rects to the host in one message (full list each frame).
     if (window.cefQuery) {
-      const rx = Math.round(rect.left * scale), ry = Math.round(rect.top * scale);
-      window.cefQuery({ request: "rect " + rx + " " + ry + " " + dw + " " + dh,
-                        persistent: false, onSuccess: function(){}, onFailure: function(){} });
+      let msg = "rects " + rects.length;
+      for (const r of rects) msg += " " + r.x + " " + r.y + " " + r.w + " " + r.h;
+      window.cefQuery({ request: msg, persistent: false, onSuccess: function(){}, onFailure: function(){} });
     }
 
     hud.textContent =
-      "rect " + Math.round(rect.left*scale) + "," + Math.round(rect.top*scale) + " " + dw + "x" + dh +
-      "  dpr " + scale.toFixed(2) +
+      renderers.length + " 3D element(s)  dpr " + dpr().toFixed(2) +
       "\neyes valid=" + eyesInfo.valid + " track=" + eyesInfo.tracking +
       "  L.x=" + eyes[0].x.toFixed(4) + " R.x=" + eyes[1].x.toFixed(4) + " z=" + eyes[0].z.toFixed(3);
 

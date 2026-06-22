@@ -12,23 +12,42 @@
     <div class="wrap">
         <h1>Inline 3D in the page</h1>
         <p class="muted">CEF offscreen-render &rarr; the host drives the real display-processor
-            weave through <code>XR_EXT_weave</code>. The host never weaves; the 3D element below is a
+            weave through <code>XR_EXT_weave</code>. The host never weaves; each 3D element below is a
             side-by-side canvas whose flat pixels are replaced by the woven 3D in the host's present
-            surface. Scroll, zoom, and drag the window &mdash; the lattice must stay locked.</p>
+            surface. The page has <strong>multiple</strong> inline-3D elements at once &mdash; mixed
+            2D/3D is driven straight from the DOM (one <code>.element3d</code> canvas per region; the
+            host weaves each per frame). Scroll, zoom, and drag the window &mdash; every lattice must
+            stay locked.</p>
 
-        <h2>Above the element</h2>
-        <p>This is ordinary 2D DOM content forming the surround. It scrolls normally. The 3D element
+        <h2>First 3D element</h2>
+        <p>This is ordinary 2D DOM content forming the surround. It scrolls normally. Each 3D element
             participates in page flow, so scrolling moves it &mdash; the host tracks its committed
             device-pixel rect every frame and feeds it to the weave RPC as the window-relative rect.</p>
         <p>As the viewer's head moves, the runtime's tracked eyes flow back to this page, which
-            re-renders the element off-axis (look-around) using an asymmetric-frustum projection.</p>
+            re-renders every element off-axis (look-around) using an asymmetric-frustum projection.</p>
 
-        <!-- THE 3D element. The host weaves this exact rect. -->
-        <canvas id="el3d" class="element3d"></canvas>
+        <!-- 3D element #1 — three depth-staggered cubes. The host weaves this exact rect. -->
+        <canvas id="el3d-1" class="element3d"></canvas>
 
-        <h2>Below the element</h2>
+        <h2>Second 3D element</h2>
+        <p>A second independent inline-3D region with its own scene (a single cube that pops well in
+            front of the screen plane). It is weaved by a separate per-element weave call into its own
+            committed rect, composited over the same present surface as the first.</p>
+
+        <!-- 3D element #2 — one cube popping out front. -->
+        <canvas id="el3d-2" class="element3d"></canvas>
+
+        <h2>Third 3D element</h2>
+        <p>A third region, deeper behind the screen. Add or remove a <code>.element3d</code> canvas and
+            the set of 3D regions changes with no host-side bookkeeping &mdash; the DOM is the zone
+            description.</p>
+
+        <!-- 3D element #3 — two cubes, one deep behind. -->
+        <canvas id="el3d-3" class="element3d"></canvas>
+
+        <h2>Below the elements</h2>
         <p>More surround text so the page is comfortably scrollable. Use the mouse wheel or Page
-            Down to scroll the 3D element across the viewport while watching the live display for any
+            Down to scroll the 3D elements across the viewport while watching the live display for any
             lattice drift or 3D collapse.</p>
         <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt
             ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation.</p>
