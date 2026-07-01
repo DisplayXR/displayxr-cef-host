@@ -1,4 +1,4 @@
-/* Copyright 2026, DisplayXR — SPDX-License-Identifier: BSL-1.0 */
+/* Copyright 2026, DisplayXR — SPDX-License-Identifier: Apache-2.0 */
 /* Demo page for the CEF OSR weave host (#625). The page is deliberately a normal
    scrollable document: 2D text surround + ONE 3D element (the SBS canvas). Scroll
    / zoom / window-drag move the element so the host's device-pixel rect tracking

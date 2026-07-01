@@ -1,5 +1,5 @@
 # Copyright 2026, DisplayXR
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # displayxr-cef-host (#625, Step A): a CEF offscreen-render browser stand-in
 # that drives the REAL display-processor weave through the shipped XR_EXT_weave
