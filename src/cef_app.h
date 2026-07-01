@@ -1,5 +1,5 @@
 // Copyright 2026, DisplayXR
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
  * @brief  CefApp for the CEF OSR weave host (#625, Step A).

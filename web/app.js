@@ -1,4 +1,4 @@
-// Copyright 2026, DisplayXR — SPDX-License-Identifier: BSL-1.0
+// Copyright 2026, DisplayXR — SPDX-License-Identifier: Apache-2.0
 // Demo page logic for the CEF OSR weave host (#625, Step A — multi-element).
 //
 // Renders EACH `.element3d` canvas as a side-by-side stereo pair (left half =
