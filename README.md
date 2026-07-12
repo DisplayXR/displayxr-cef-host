@@ -1,7 +1,7 @@
 # displayxr-cef-host (#625, Step A)
 
 A **CEF offscreen-render (OSR) browser stand-in** that drives the **real**
-DisplayXR display-processor weave through the shipped `XR_EXT_weave` RPC. It is
+DisplayXR display-processor weave through the shipped `XR_DXR_weave` RPC. It is
 the Step-A milestone of the inline-3D-in-the-browser roadmap (issue #625):
 validate the full weave round-trip + phase/position exactness under scroll / zoom
 / window-drag on a Chromium-faithful engine — **without** any host-side weave
@@ -18,7 +18,7 @@ side-by-side painter.
 demo page (WebGL SBS)        CEF (OSR)              host (this exe)
  render 3D element SBS  ───▶  composite page  ───▶  OnAcceleratedPaint(shared D3D11 tex)
  post device-px rect    ──cefQuery(rect)──────────▶ extract element sub-rect → SBS input
- (re-render off-axis)   ◀──cefQuery(eyes)────────── xrWeaveSubmitEXT(SBS, rect)
+ (re-render off-axis)   ◀──cefQuery(eyes)────────── xrWeaveSubmitDXR(SBS, rect)
                                                      → weaved tex + fence + eyes
                                                      composite weaved sub-rect over page; present
 ```
@@ -42,7 +42,7 @@ Requires Visual Studio 2022 (C++ workload) + Ninja. Output (exe + CEF payload +
 
 ## Run (on the 3D display)
 
-1. Ensure the DisplayXR runtime is installed/registered with `XR_EXT_weave`
+1. Ensure the DisplayXR runtime is installed/registered with `XR_DXR_weave`
    support and `displayxr-cli selftest` passes; start `displayxr-service` if it
    isn't running (it's the orchestrator — don't leave it down).
 2. The weave service is **IPC-only** — run forced-IPC: set `XRT_FORCE_MODE=ipc`

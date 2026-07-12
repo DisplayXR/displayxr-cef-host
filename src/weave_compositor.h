@@ -8,7 +8,7 @@
  *   1. Extracts the page's 3D-element sub-rect (the pre-weave side-by-side pair)
  *      from the cached composited-page texture into a keyed-mutex shared input
  *      texture.
- *   2. Drives the shipped weave RPC: xrWeaveSubmitEXT(inputSBS, windowRelRect)
+ *   2. Drives the shipped weave RPC: xrWeaveSubmitDXR(inputSBS, windowRelRect)
  *      -> weaved shared texture + fence + the DP's current tracked eyes. The
  *      host NEVER weaves; the DP does, inside the runtime (ADR-007 / ADR-019).
  *   3. GPU-waits the fence, then composites the page (base) + the weaved sub-rect
@@ -28,7 +28,7 @@
 
 #define XR_USE_GRAPHICS_API_D3D11
 #include "xr_session_common.h"
-#include <openxr/XR_EXT_weave.h>
+#include <openxr/XR_DXR_weave.h>
 
 #include "host_bridge.h"
 
@@ -54,7 +54,7 @@ class WeaveCompositor {
  private:
 	bool EnsureBlitPipeline();
 	bool EnsureSbsInput(uint32_t w, uint32_t h);
-	bool OpenHandback(const XrWeaveOutputEXT &out);
+	bool OpenHandback(const XrWeaveOutputDXR &out);
 	void BlitQuad(ID3D11ShaderResourceView *srv,
 	              float dstX,
 	              float dstY,

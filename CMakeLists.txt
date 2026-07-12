@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # displayxr-cef-host (#625, Step A): a CEF offscreen-render browser stand-in
-# that drives the REAL display-processor weave through the shipped XR_EXT_weave
+# that drives the REAL display-processor weave through the shipped XR_DXR_weave
 # RPC. The host never weaves — it hands the runtime a pre-weave SBS sub-rect and
 # composites the weaved handback (ADR-007 / ADR-019).
 #
 # Deps are fetched by scripts/setup-deps.bat to short, space-free paths:
 #   CEF_ROOT     (default C:\dev\cef\149.0.4)        — CEF binary distribution
 #   OpenXR_ROOT  (default C:\dev\openxr_sdk_1.1.43)  — OpenXR loader (.lib/.dll)
-# The DisplayXR OpenXR extension headers (XR_EXT_weave etc.) are vendored under
+# The DisplayXR OpenXR extension headers (XR_DXR_weave etc.) are vendored under
 # third_party/ (synced from the runtime's src/external/openxr_includes).
 
 cmake_minimum_required(VERSION 3.21)
@@ -38,11 +38,11 @@ endif()
 
 # ---------------------------------------------------------------------------
 # Vendored DisplayXR OpenXR headers (core + custom extensions). Used as the
-# single header source for OpenXR so XR_EXT_weave is guaranteed present.
+# single header source for OpenXR so XR_DXR_weave is guaranteed present.
 # ---------------------------------------------------------------------------
 set(DXR_OPENXR_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/displayxr_openxr_includes")
-if(NOT EXISTS "${DXR_OPENXR_INCLUDE}/openxr/XR_EXT_weave.h")
-    message(FATAL_ERROR "Vendored XR_EXT_weave.h missing under ${DXR_OPENXR_INCLUDE}")
+if(NOT EXISTS "${DXR_OPENXR_INCLUDE}/openxr/XR_DXR_weave.h")
+    message(FATAL_ERROR "Vendored XR_DXR_weave.h missing under ${DXR_OPENXR_INCLUDE}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -77,8 +77,7 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${DXR_OPENXR_INCLUDE}" CACHE PATH "Display
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v1.1.1
-    GIT_SHALLOW TRUE
+    GIT_TAG 28d6eb7b9898cde447d90bfecda8b6734be83db1
 )
 FetchContent_MakeAvailable(displayxr_common)
 
