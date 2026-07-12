@@ -40,5 +40,5 @@ Rules:
 | 1004999190–191 | `XR_DXR_weave` | 190 = `XR_TYPE_WEAVE_SUBMIT_INFO_DXR`, 191 = `XR_TYPE_WEAVE_OUTPUT_DXR` (#625) |
 | 1004999200+ | **next free** | |
 
-`XR_EXT_android_surface_binding` defines no `1000999xxx` values in this
+`XR_DXR_android_surface_binding` defines no `1000999xxx` values in this
 directory as of this writing; if it gains any, claim a decade here first.
