@@ -21,7 +21,7 @@
 
 #include "include/wrapper/cef_message_router.h"
 
-//! Mirrors XR_WEAVE_MAX_EYES_EXT (kept local so this header has no OpenXR dep).
+//! Mirrors XR_WEAVE_MAX_EYES_DXR (kept local so this header has no OpenXR dep).
 static const uint32_t kHostMaxEyes = 8;
 
 //! One inline-3D element's committed device-pixel rect within the window client
@@ -59,7 +59,7 @@ struct HostBridge {
 	// The persistent cefQuery callback the page registered to receive eyes.
 	CefRefPtr<CefMessageRouterBrowserSide::Callback> eyesCallback;
 
-	// Latest eyes returned by xrWeaveSubmitEXT (written by main, delivered to
+	// Latest eyes returned by xrWeaveSubmitDXR (written by main, delivered to
 	// the page via eyesCallback). Display-space metres, [eye*3 + {0:x,1:y,2:z}].
 	float eyes[kHostMaxEyes * 3] = {};
 	uint32_t eyeCount = 0;

@@ -3,19 +3,19 @@
 /*!
  * @file
  * @brief  CEF OSR weave host (#625, Step A) — a browser stand-in that drives
- *         the REAL display-processor weave through the shipped XR_EXT_weave RPC.
+ *         the REAL display-processor weave through the shipped XR_DXR_weave RPC.
  *
  * A present-owner, modelled on the runtime's weave_rpc_probe harness, with a
  * real Chromium engine (CEF, offscreen-render) as the content source instead of
  * a synthetic side-by-side painter:
  *
  *   1. Own OS window + a transparent DirectComposition swap chain.
- *   2. Forced-IPC OpenXR session bound to that window (XR_EXT_win32_window_binding,
- *      transparent, no shared texture). xrWeaveBindWindowEXT(window) once.
+ *   2. Forced-IPC OpenXR session bound to that window (XR_DXR_win32_window_binding,
+ *      transparent, no shared texture). xrWeaveBindWindowDXR(window) once.
  *   3. CEF renders the page offscreen; OnAcceleratedPaint hands a shared D3D11
  *      texture of the composited page (zero-copy, public CEF API).
  *   4. Per frame: extract the page's 3D-element sub-rect (its pre-weave SBS pair),
- *      xrWeaveSubmitEXT(sbs, windowRelativeRect) -> weaved texture + fence + the
+ *      xrWeaveSubmitDXR(sbs, windowRelativeRect) -> weaved texture + fence + the
  *      DP's tracked eyes; composite the weaved sub-rect back over the element rect
  *      and present. The eyes flow back to the page so it re-renders off-axis.
  *
@@ -606,7 +606,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		}
 
 		XrResult br = g_pfnWeaveBindWindow(xr.session, (void *)g_hwnd);
-		LogXrResult("xrWeaveBindWindowEXT", br);
+		LogXrResult("xrWeaveBindWindowDXR", br);
 		if (XR_FAILED(br)) {
 			break;
 		}

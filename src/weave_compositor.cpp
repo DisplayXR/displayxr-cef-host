@@ -141,7 +141,7 @@ WeaveCompositor::EnsureSbsInput(uint32_t w, uint32_t h)
 }
 
 bool
-WeaveCompositor::OpenHandback(const XrWeaveOutputEXT &out)
+WeaveCompositor::OpenHandback(const XrWeaveOutputDXR &out)
 {
 	if (out.weavedTexture != nullptr) {
 		weaved_.Reset();
@@ -278,7 +278,7 @@ WeaveCompositor::Frame(XrSession session,
 
 		// Extract the element sub-rect (the pre-weave SBS pair) into the
 		// keyed-mutex input texture. key 0 = "caller done writing, runtime may
-		// read" — release BEFORE xrWeaveSubmitEXT or the service's same-key
+		// read" — release BEFORE xrWeaveSubmitDXR or the service's same-key
 		// acquire would block. (pageTex is read here while also bound as the page
 		// SRV above — both reads, no hazard.)
 		if (sbs_mutex_->AcquireSync(0, 1000) != S_OK) {
@@ -295,7 +295,7 @@ WeaveCompositor::Frame(XrSession session,
 		context_->Flush();
 		sbs_mutex_->ReleaseSync(0);
 
-		XrWeaveSubmitInfoEXT in = {XR_TYPE_WEAVE_SUBMIT_INFO_EXT};
+		XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
 		in.inputTexture = (void *)sbs_handle_;
 		in.inputIsDxgi = XR_FALSE;
 		in.rect.offset.x = rx;
@@ -303,14 +303,14 @@ WeaveCompositor::Frame(XrSession session,
 		in.rect.extent.width = rw;
 		in.rect.extent.height = rh;
 
-		XrWeaveOutputEXT out = {XR_TYPE_WEAVE_OUTPUT_EXT};
+		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
 		LARGE_INTEGER f, t0, t1;
 		QueryPerformanceFrequency(&f);
 		QueryPerformanceCounter(&t0);
 		XrResult sr = g_pfnWeaveSubmit(session, &in, &out);
 		QueryPerformanceCounter(&t1);
 		if (XR_FAILED(sr)) {
-			LogXrResult("xrWeaveSubmitEXT", sr);
+			LogXrResult("xrWeaveSubmitDXR", sr);
 			continue;
 		}
 		totalMs += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
