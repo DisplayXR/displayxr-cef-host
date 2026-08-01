@@ -1,16 +1,38 @@
-# displayxr-cef-host (#625, Step A)
+# displayxr-cef-host — minimal `XR_DXR_weave` reference host
 
-A **CEF offscreen-render (OSR) browser stand-in** that drives the **real**
-DisplayXR display-processor weave through the shipped `XR_DXR_weave` RPC. It is
-the Step-A milestone of the inline-3D-in-the-browser roadmap (issue #625):
-validate the full weave round-trip + phase/position exactness under scroll / zoom
-/ window-drag on a Chromium-faithful engine — **without** any host-side weave
-shader. The host **never weaves**; the display processor does, inside the
-runtime (ADR-007 / ADR-019). Vendor-neutral throughout.
+A small **CEF offscreen-render (OSR)** application that drives the **real**
+DisplayXR display-processor weave through the shipped `XR_DXR_weave` RPC. The
+host **never weaves**; the display processor does, inside the runtime
+(ADR-007 / ADR-019). Vendor-neutral throughout.
 
-This is the runtime's `weave_rpc_probe_d3d11_win` present-owner skeleton with a
-real Chromium engine (CEF) as the content source instead of a synthetic
-side-by-side painter.
+> **This is not a browser you should use.** That is
+> [`displayxr-browser`](https://github.com/DisplayXR/displayxr-browser) — a real
+> Chromium fork that weaves inline 3D on any page. This repo is a *reference and
+> a test tool*, and it is deliberately kept small.
+
+## Why it still exists
+
+It began as Step A of the inline-3D-in-the-browser roadmap (issue #625): prove
+the full weave round-trip and phase/position exactness under scroll / zoom /
+window-drag on a Chromium-faithful engine, before committing to a Chromium fork.
+That milestone shipped and was hardware-validated on Leia, and the browser
+superseded it as the *product* path. Two jobs outlived it:
+
+- **A fast reproducer for weave/DP bugs.** It builds in minutes. The browser
+  fork is a 1–3 hour build on a dedicated 64-vCPU box, so when the weave
+  extension or a display processor regresses, this is where you bisect it —
+  not in Chromium.
+- **The integration example for third parties.** It shows how to drive the weave
+  from your own present-owner without forking Chromium: hand the runtime a
+  side-by-side texture and a window rect, composite the result you get back.
+  The browser can't serve that purpose, because it *is* the fork.
+
+Expect maintenance, not features. If it stops building against a current runtime,
+that is a bug worth fixing — a reproducer that doesn't run is worth nothing.
+
+Structurally it is the runtime's `weave_rpc_probe_d3d11_win` present-owner
+skeleton with a real Chromium engine (CEF) as the content source instead of a
+synthetic side-by-side painter.
 
 ## How it works
 
