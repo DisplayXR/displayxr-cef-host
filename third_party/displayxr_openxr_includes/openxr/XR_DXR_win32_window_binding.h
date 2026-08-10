@@ -6,7 +6,8 @@
 // Khronos OpenXR registry: extension numbers and XrStructureType values sit
 // in a provisional experimental block (1004999xxx) pending official
 // assignment. Extension names are expected to be stable; numeric values are
-// not. SPEC_VERSION restarted at 1 on the XR_EXT_* -> XR_DXR_* rename.
+// not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
+// interface history did not restart with the name).
 // See GOVERNANCE.md.
 //
 /*!
@@ -39,7 +40,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_win32_window_binding 1
-#define XR_DXR_win32_window_binding_SPEC_VERSION 1
+#define XR_DXR_win32_window_binding_SPEC_VERSION 8
 #define XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_win32_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
@@ -91,8 +92,8 @@ typedef struct XrWin32WindowBindingCreateInfoDXR {
     void*                       sharedTextureHandle;   //!< Shared D3D11/D3D12 texture HANDLE for zero-copy, or NULL
     //! When XR_TRUE, the runtime configures the bound HWND for transparent desktop
     //! composition: pixels written by the app with full opacity appear opaque on screen,
-    //! and pixels written transparent (alpha = 0, or matching a chroma key set by the
-    //! app via SetLayeredWindowAttributes) compose through to the desktop underneath.
+    //! and pixels written transparent (alpha = 0) compose through to the desktop
+    //! underneath.
     //! The runtime picks the appropriate DXGI / Windows mechanism per graphics API;
     //! apps should not depend on which one. Only honored when windowHandle is non-NULL
     //! and the session is standalone — ignored in workspace/shell mode.
