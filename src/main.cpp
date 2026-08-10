@@ -614,6 +614,14 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 		if (!compositor.Init(g_device.Get(), g_context.Get())) {
 			break;
 		}
+		// Active-mode atlas geometry for the spec-v6 N-view submit path. Only
+		// available after the session exists; absent/failed -> v3 batch.
+		{
+			WeaveModeInfo mode;
+			if (QueryWeaveModeInfo(xr, &mode)) {
+				compositor.SetModeInfo(mode);
+			}
+		}
 		bridge.device = g_device;
 		bridge.context = g_context;
 

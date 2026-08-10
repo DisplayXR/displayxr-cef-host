@@ -26,13 +26,52 @@
 
 // XR_DXR_weave available + enabled on the instance, and the resolved entry points.
 extern bool g_hasWeaveExt;
+
+//! The XR_DXR_weave SPEC version the RUNTIME reported at extension enumeration
+//! (0 = extension absent). The host negotiates DOWN to it, so a newer vendored
+//! header never forces a newer runtime:
+//!   >= 3  batched submit (chained XrWeaveSubmitRectsDXR) — one call per frame.
+//!   >= 5  XrWeaveSubmitInfoDXR::firstChunk — the runtime clears its woven
+//!         output to transparent, so the host can draw it back WHOLE-WINDOW.
+//! Anything lower takes the legacy one-submit-per-element path.
+//!
+//! Set DXR_WEAVE_MAX_SPEC=<n> to cap this (never raise it) — one build then
+//! reproduces every submit shape the extension has shipped against a current
+//! runtime, which is the point of keeping this host around.
+extern uint32_t g_weaveSpecVersion;
 extern PFN_xrWeaveBindWindowDXR g_pfnWeaveBindWindow;
 extern PFN_xrWeaveSubmitDXR g_pfnWeaveSubmit;
 extern PFN_xrWeaveSnapWindowRectDXR g_pfnWeaveSnapWindowRect; // #625 window-drag phase lock (may be NULL on an older runtime)
 
+/*!
+ * @brief The active rendering mode's atlas geometry — what spec-v6 needs.
+ *
+ * Queried once via xrEnumerateDisplayRenderingModesDXR. @c atlasWidth /
+ * @c atlasHeight are the WORST CASE over every enumerated mode, derived from
+ * the DISPLAY (not the window), so the v6 input atlas is allocated once and
+ * survives resize / fullscreen (ADR-010). Note the worst case is NOT bounded by
+ * the display size — a mode with viewScaleX 1.0 and tileColumns 2 needs 2W.
+ */
+struct WeaveModeInfo
+{
+	uint32_t viewCount = 0;
+	uint32_t tileColumns = 0;
+	uint32_t tileRows = 0;
+	float viewScaleX = 0.0f;
+	float viewScaleY = 0.0f;
+	uint32_t atlasWidth = 0;  //!< worst case over all modes
+	uint32_t atlasHeight = 0; //!< worst case over all modes
+	bool valid = false;
+};
+
 // Initialize OpenXR instance + system; detect/enable D3D11 + win32_window_binding
 // + display_info + weave.
 bool InitializeOpenXR(XrSessionManager& xr);
+
+// Query the active rendering mode + the worst-case atlas size for the spec-v6
+// submit path. Returns false if XR_DXR_display_info is absent or enumeration
+// fails, in which case the caller falls back to the v3 batch layout.
+bool QueryWeaveModeInfo(XrSessionManager& xr, WeaveModeInfo* out);
 
 // Get the D3D11 graphics requirements (adapter LUID) so the host's device is on
 // the adapter the runtime requires (shared handles only work same-adapter).
