@@ -1,0 +1,84 @@
+name: build
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore: ['**.md']
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+
+# A newer push supersedes an in-flight run.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # CEF is a ~340 MB download that expands to a multi-GB tree, so cache the
+      # extracted root on the pinned version. setup-deps.bat is idempotent and
+      # skips whatever is already present, so a cache hit makes it a no-op.
+      - name: Cache CEF + OpenXR loader
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\dev\cef\149.0.4
+            C:\dev\openxr_sdk_1.1.43
+          key: deps-cef149.0.4-openxr1.1.43
+
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+
+      - name: Fetch dependencies
+        run: scripts\setup-deps.bat
+        shell: cmd
+
+      - name: Build
+        run: scripts\build.bat
+        shell: cmd
+
+      # build.bat reports failure via its own exit code, but a green build that
+      # produced no exe would be worse than a red one — assert the artifact.
+      - name: Assert the host binary exists
+        run: |
+          if (-not (Test-Path 'build\Release\displayxr_cef_host.exe')) {
+            throw 'displayxr_cef_host.exe missing after a successful build'
+          }
+          Get-Item 'build\Release\displayxr_cef_host.exe' | Select-Object FullName, Length
+
+  # The vendored OpenXR headers are copies of the runtime's canonical set. Drift
+  # between them is what makes this host teach a stale API, so surface it — but
+  # do not block unrelated PRs on the runtime having moved ahead (that is a
+  # "go run the sync", not a "this PR is wrong").
+  header-sync:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Diff vendored headers against displayxr-runtime@main
+        run: |
+          set -u
+          base=https://raw.githubusercontent.com/DisplayXR/displayxr-runtime/main/src/external/openxr_includes/openxr
+          drift=0
+          for f in third_party/displayxr_openxr_includes/openxr/*.h; do
+            name=$(basename "$f")
+            if ! curl -fsSL "$base/$name" -o /tmp/upstream.h; then
+              echo "::warning::$name has no counterpart upstream (removed or renamed there)"
+              continue
+            fi
+            if ! diff -q "$f" /tmp/upstream.h > /dev/null; then
+              echo "::warning file=$f::$name differs from the runtime's canonical copy — re-sync it"
+              drift=1
+            fi
+          done
+          if [ "$drift" -eq 0 ]; then
+            echo "OK: vendored headers are byte-for-byte identical to displayxr-runtime@main."
+          else
+            echo "Re-sync with:  cp <runtime>/src/external/openxr_includes/openxr/* third_party/displayxr_openxr_includes/openxr/"
+            exit 1
+          fi
