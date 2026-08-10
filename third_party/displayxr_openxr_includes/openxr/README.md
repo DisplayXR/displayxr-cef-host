@@ -5,10 +5,10 @@ DisplayXR's custom OpenXR extensions. They auto-sync to the public
 [`displayxr-extensions`](https://github.com/DisplayXR/displayxr-extensions)
 repo on every push to `main`.
 
-## Type-value allocation registry (`1000999xxx`)
+## Type-value allocation registry (`1004999xxx`)
 
 All DisplayXR extension `XrStructureType` (and extension `XrResult`) values
-live in the provisional `1000999xxx` block, pending Khronos registry
+live in the provisional `1004999xxx` block, pending Khronos registry
 reconciliation at spec freeze. **This table is the single source of truth for
 allocations — claim a block here BEFORE defining values in a new header.**
 Three extensions previously collided by each guessing the "next free slot" in
@@ -37,8 +37,10 @@ Rules:
 | 1004999160–166 | `XR_DXR_local_3d_zone` | relocated from 130–136 (collided with mcp_tools) — spec v4 |
 | 1004999170–171 | `XR_DXR_atlas_capture` | relocated from 120–121 (collided with workspace_file_dialog) — spec v3 |
 | 1004999180 | `XR_DXR_macos_gl_binding` | relocated from 1004999010 (collided with display_info) — spec v2 |
-| 1004999190–191 | `XR_DXR_weave` | 190 = `XR_TYPE_WEAVE_SUBMIT_INFO_DXR`, 191 = `XR_TYPE_WEAVE_OUTPUT_DXR` (#625) |
-| 1004999200+ | **next free** | |
+| 1004999190–194 | `XR_DXR_weave` | 190 = `XR_TYPE_WEAVE_SUBMIT_INFO_DXR`, 191 = `XR_TYPE_WEAVE_OUTPUT_DXR` (#625), 192 = `XR_TYPE_WEAVE_SUBMIT_RECTS_DXR` (batch, spec v3), 193 = `XR_TYPE_WEAVE_SUBMIT_OVERLAYS_DXR` (2D overlay atlas, spec v4, browser#18), 194 = `XR_TYPE_WEAVE_SUBMIT_LAYOUT_DXR` (N-view worst-case atlas, spec v6, #774) |
+| 1004999200–209 | `XR_DXR_xlib_window_binding` | 200 = `XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR` (#660 Phase 3) |
+| 1004999210–219 | `XR_DXR_display_info` (v16+ additions) | 210 = `XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR` (#715); fresh decade rather than reusing the 005/009 gaps in the original block |
+| 1004999220+ | **next free** | |
 
-`XR_DXR_android_surface_binding` defines no `1000999xxx` values in this
+`XR_DXR_android_surface_binding` defines no `1004999xxx` values in this
 directory as of this writing; if it gains any, claim a decade here first.
