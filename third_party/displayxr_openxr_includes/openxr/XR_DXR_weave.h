@@ -136,8 +136,11 @@
  *
  * Sync on Android is the macOS contract: the caller finishes its GPU writes
  * before submitting and the submit returns only once the woven output is
- * GPU-complete (no fence handle, fenceValue is a monotonic counter). An
- * fd-based (`sync_file`) acquire/release variant is a documented follow-up.
+ * GPU-complete (no fence handle, fenceValue is a monotonic counter). The
+ * fd-based (`sync_file`) acquire/release variant arrived in v10 for desktop
+ * Linux (XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR) and reached Android in
+ * v20 — see "Android sync_file fences" below. A caller that chains neither keeps
+ * this synchronous contract on every version.
  *
  * Per-region hardware wish (SPEC_VERSION 8, browser#88 Phase 3 item A). Until v8
  * the weave path drove the panel's physical 3D element ALL-OR-NOTHING: a present-
@@ -182,7 +185,173 @@
  * xrWeaveExportIpcConnectionDXR + XrWeaveIpcConnectionDXR, brokering a runtime
  * IPC endpoint to a sandboxed sibling process (browser#103), plus the §4b error
  * table (a dead connection now reports XR_ERROR_INSTANCE_LOST /
- * XR_ERROR_SESSION_LOST instead of a generic XR_ERROR_RUNTIME_FAILURE).
+ * XR_ERROR_SESSION_LOST instead of a generic XR_ERROR_RUNTIME_FAILURE); 10 =
+ * desktop-Linux dma-buf transport (#1699): XR_WEAVE_HANDLE_KIND_DMABUF_DXR /
+ * _OPAQUE_FD_DXR, XrWeaveDmabufDescDXR + XrWeaveOverlayDmabufDescDXR (fd + DRM
+ * fourcc + modifier + per-plane layout in), XrWeaveOutputDmabufDXR (fd-typed
+ * woven output), and sync_file fences XrWeaveSubmitSyncDXR (acquire, in) /
+ * XrWeaveOutputSyncDXR (release, out, every frame); 11 = bulk grid snap
+ * (#1723): xrWeaveSnapWindowGridDXR + XrWeaveSnapGridInfoDXR /
+ * XrWeaveSnapGridPointDXR — one call per drag instead of one per probed point;
+ * 12 = woven origin per output (browser-pvt#180): XrWeaveOutputOriginDXR (out,
+ * chained on XrWeaveOutputDXR — the origin each woven output was woven for, plus
+ * a per-output serial) and XrWeaveWindowLogicalOriginDXR (in, chained on
+ * XrWeaveBindWindowInfoDXR — the caller's own LOGICAL origin + scale, echoed
+ * back verbatim), so a present-owner can tag its own Wayland commit for
+ * move-synchronised drag. (13..19: see the per-version notes below; 20 =
+ * XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR accepted on Android.)
+ *
+ * An unreadable overlay refuses the submit on desktop Linux (SPEC_VERSION 16).
+ * No new structure: from v16 the desktop-Linux engine, like the D3D11 service
+ * always did, refuses a submit whose chained v4 overlay it cannot import
+ * (XR_ERROR_RUNTIME_FAILURE) BEFORE the woven output is touched, so there
+ * "accepted with an overlay chained" means "the overlay was composited". Before
+ * v16 it dropped the overlay and wove anyway. A desktop-Linux caller that hands
+ * the whole of its 2D over as the overlay gates on extensionVersion >= 16. The
+ * macOS and Android engines still drop an unreadable overlay.
+ *
+ * A stale-size overlay is ignored on desktop Linux (SPEC_VERSION 17). No new
+ * structure: an overlay is window-sized by definition, and one whose size is
+ * not this submit's window size (a producer that has not reallocated it after
+ * a resize yet) is treated as ABSENT for that submit — the content is woven,
+ * the submit is ACCEPTED, and nothing of the overlay is composited. It is not
+ * refused (refusing through every resize would hold frames), and it is no
+ * longer stretched over the output (before v17 the runtime's post-weave blend
+ * composited a smaller overlay as if it were window-sized: a black margin and
+ * misplaced 2D). This qualifies v16: "accepted with an overlay chained" means
+ * "composited" only for an overlay of the window's size. A caller whose
+ * overlay IS its 2D gates on extensionVersion >= 17 before relying on it, and
+ * otherwise keeps a mismatched overlay off the wire itself.
+ *
+ * Per-screen parts of each weave rect (SPEC_VERSION 19, #1884, ADR-047
+ * Amendment 4). On a system with two or more 3D screens the bound window can
+ * straddle a seam. The runtime then weaves the window PER SCREEN: each screen's
+ * part is woven by that screen's own display processor, at that screen's own
+ * interlace phase, and each screen's part has its own viewer (that screen's eye
+ * tracker). One eye pair per submit is then wrong for the part on the other
+ * screen, so v19 adds XrWeaveOutputRectPartsDXR, chained on
+ * XrWeaveOutputDXR::next: the window's per-screen segments, each with its own
+ * eyes (in THAT screen's display space), and every submitted rect split into
+ * per-screen parts. The caller renders the pixels of each part from its
+ * segment's eyes. On a window entirely on one screen (every window on a
+ * one-screen system) segmentCount is 0 and the base XrWeaveOutputDXR eyes apply
+ * to everything, exactly as before. A caller that does not chain the struct sees
+ * no change at all. Batch (v3) and N-view (v6) submits are segmented; a legacy
+ * single-rect submit is not. Windows (D3D11 service) only; segmentCount is 0
+ * elsewhere. xrWeaveSnapWindowRectDXR snaps against the lattice of the screen
+ * holding the majority of the window (same hysteresis as ADR-047 Amendment 2).
+ *
+ * Android sync_file fences (SPEC_VERSION 20). No new structure: from v20 the
+ * Android engine accepts v10's XrWeaveSubmitSyncDXR and XrWeaveOutputSyncDXR on
+ * an AHardwareBuffer submit (no dma-buf descriptor — the AHardwareBuffer IS the
+ * Android transport), so a present-owner can pipeline its GPU work with the weave
+ * instead of serialising the frame on the CPU:
+ *
+ *  - IN. XrWeaveSubmitSyncDXR::acquireFenceFd is a sync_file that signals when
+ *    the caller's GPU has finished WRITING the input (and overlay) AND finished
+ *    READING the previous woven output — one fence, both hazards, exactly as on
+ *    desktop Linux (the woven AHardwareBuffer is single-buffered). The runtime
+ *    waits it on the GPU before it touches either. -1 = no fence (the caller has
+ *    already finished, the v9 contract).
+ *  - OUT. XrWeaveOutputSyncDXR::releaseFenceFd receives a per-frame sync_file
+ *    that signals when THIS submit's woven output is complete, and
+ *    xrWeaveSubmitDXR then returns WITHOUT waiting for the weave on the CPU. It
+ *    also marks the end of the runtime's reads of this submit's input and
+ *    overlay: the caller must not write them again before it signals. -1
+ *    means the submit completed synchronously (the runtime fell back to its CPU
+ *    wait for that frame — a display processor that cannot join the GPU chain,
+ *    a dropped frame, the service kill switch): the output is ready now.
+ *  - NEITHER chained = unchanged: xrWeaveSubmitDXR returning is the completion
+ *    signal. The two halves are independent (acquire alone keeps the
+ *    synchronous return; release alone assumes the caller finished, as in v9).
+ *
+ * FD ownership is v10's: an acquire fd is the runtime's once xrWeaveSubmitDXR
+ * returns XR_SUCCESS (and stays the caller's on any other result); a release fd
+ * is the caller's to close. Capability = extensionVersion >= 20 on Android;
+ * before v20 the Android runtime refuses XrWeaveSubmitSyncDXR
+ * (XR_ERROR_VALIDATION_FAILURE) and writes -1 into XrWeaveOutputSyncDXR. The
+ * dma-buf structs stay desktop-Linux only.
+ *
+ * Android: an overlay is per submit, and an unreadable one refuses (SPEC_VERSION
+ * 18). No new structure: from v18 the Android engine applies the v16 rule too
+ * (a chained overlay it cannot import refuses the submit, XR_ERROR_RUNTIME_FAILURE,
+ * before the woven output is touched) and composites an overlay only on a submit
+ * that chains one. Before v18 it composited the last overlay it had imported on
+ * every later submit, chained or not. An Android caller that hands the whole of
+ * its 2D over as the overlay gates on extensionVersion >= 18. The macOS engine
+ * still drops an unreadable overlay.
+ *
+ * Overlay filter strength (SPEC_VERSION 15). XrWeaveSubmitOverlayFilterDXR, chained
+ * next to an XrWeaveSubmitOverlaysDXR: how strongly a display processor that
+ * band-limits the 2D layer for its lens filters it, 0..1 (0 = no lens filtering,
+ * 1 = the full lens cell). Absent = the display processor's own default, which
+ * is what a caller that does not know better should use.
+ *
+ * Overlay unchanged (SPEC_VERSION 14). XrWeaveSubmitOverlayUnchangedDXR, chained
+ * on XrWeaveSubmitInfoDXR next to an XrWeaveSubmitOverlaysDXR: the caller declares
+ * that this submit's overlay atlas holds exactly the pixels of the previous
+ * accepted submit's, so derived work (a display processor's lens prefilter of
+ * the 2D layer) may be reused instead of recomputed. Advisory, per submit.
+ *
+ * Mono in hardware 2D (SPEC_VERSION 13). XrWeaveSubmitMonoIn2DDXR, chained on
+ * XrWeaveSubmitInfoDXR: while the session's hardware state is 2D, the output is
+ * one view (stereo: the left view), flat, instead of the weave. Desktop Linux;
+ * ignored elsewhere.
+ *
+ * Woven origin per output (SPEC_VERSION 12, browser-pvt#180). On native Wayland
+ * (GNOME extension version 9+) a drag is MOVE-SYNCHRONISED: the extension holds
+ * the window's actor at the position the buffer it is about to paint was woven
+ * for, so every painted frame is phase-correct at any logical position. It learns
+ * that position from a per-commit TAG — a 1x1 synchronised subsurface of the
+ * committed surface at (x mod 256, y mod 256) of the LOGICAL content origin the
+ * frame was woven for (docs/specs/runtime/wayland-window-geometry.md §9). A
+ * window-bound runtime session tags its own commits. A present-owner commits the
+ * woven pixels ITSELF, so it has to tag them itself — and for that it needs to
+ * know, per woven output, which bound origin the weave used, because a re-bind
+ * (every move) and the weave that consumes it are not the same moment.
+ *
+ *  - OUT. Chain an XrWeaveOutputOriginDXR onto XrWeaveOutputDXR::next. Every
+ *    successful xrWeaveSubmitDXR fills it with the origin THIS submit's weave was
+ *    phase-locked to (the bind in effect when the runtime ran the weave — see the
+ *    struct) and a serial that increases with every woven output.
+ *  - IN. Chain an XrWeaveWindowLogicalOriginDXR onto XrWeaveBindWindowInfoDXR::next
+ *    beside the v7 XrWeaveWindowGeometryDXR to give the runtime the logical
+ *    origin + output scale the caller derived its device-pixel geometry from.
+ *    The runtime never converts device pixels back to logical ones (a fresh
+ *    rounding is exactly how a 150 % output lands one pixel off); it latches the
+ *    caller's pair with the device geometry and echoes it back per output.
+ *
+ * The runtime does NOT encode the tag. The presenter takes
+ * wovenOriginLogical mod 256 itself (non-negative modulo, so a window left of /
+ * above the stage origin still encodes), which MUST equal the runtime's
+ * COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD and the extension's MOVE_SYNC_TAG_MOD.
+ *
+ * Desktop-Linux dma-buf transport (SPEC_VERSION 10, #1699). A file descriptor is
+ * an int, not a pointer, and carries no dimensions, format or tiling, so v10 does
+ * not squeeze it into @c inputTexture. It adds typed chains instead:
+ *
+ *  - IN. Chain an XrWeaveDmabufDescDXR onto XrWeaveSubmitInfoDXR::next (and an
+ *    XrWeaveOverlayDmabufDescDXR when an XrWeaveSubmitOverlaysDXR is chained): the
+ *    fd, DRM fourcc, DRM format modifier and per-plane offsets/strides — what a
+ *    Vulkan VK_EXT_image_drm_format_modifier import needs. @c inputTexture /
+ *    @c overlayTexture are then ignored (pass NULL).
+ *  - OUT. Chain an XrWeaveOutputDmabufDXR onto XrWeaveOutputDXR::next to receive
+ *    the woven output as a dma-buf, with the same lifetime @c weavedTexture has:
+ *    first successful submit and every reallocation, fd -1 in between.
+ *  - SYNC. XrWeaveSubmitSyncDXR carries an acquire sync_file (the runtime waits it
+ *    on the GPU before reading the input); XrWeaveOutputSyncDXR returns a release
+ *    sync_file EVERY FRAME (the caller waits it before sampling the output). The
+ *    woven dma-buf is once-per-allocation; the release fence is per-frame.
+ *
+ * FD OWNERSHIP follows the Vulkan external-handle rule: every fd the caller
+ * passes IN is the runtime's once xrWeaveSubmitDXR returns XR_SUCCESS, and stays
+ * the caller's on any other result. Every fd handed OUT is the caller's to close.
+ *
+ * All v10 structs are platform-neutral in layout (fds are int32_t, as in
+ * XrWeaveIpcConnectionDXR) but ACCEPTED ONLY ON DESKTOP LINUX: a DMABUF /
+ * OPAQUE_FD kind or an input descriptor on any other platform is
+ * XR_ERROR_VALIDATION_FAILURE. The two OUT chains are harmless everywhere — a
+ * runtime with nothing to put in them writes fd -1.
  */
 #ifndef XR_DXR_WEAVE_H
 #define XR_DXR_WEAVE_H 1
@@ -195,7 +364,7 @@ extern "C" {
 #endif
 
 #define XR_DXR_weave 1
-#define XR_DXR_weave_SPEC_VERSION 9
+#define XR_DXR_weave_SPEC_VERSION 20
 #define XR_DXR_WEAVE_EXTENSION_NAME "XR_DXR_weave"
 
 // Reserved 1004999190..199. Final values reconcile with the Khronos registry
@@ -216,6 +385,28 @@ extern "C" {
 // Reserved 1004999240..249 — a fresh decade for spec v9+ additions, because the
 // 190..199 block above is exhausted (199 is spoken for). Same registry.
 #define XR_TYPE_WEAVE_IPC_CONNECTION_DXR ((XrStructureType)1004999240)
+// Spec v10 (#1699): desktop-Linux dma-buf transport + sync_file fences.
+#define XR_TYPE_WEAVE_DMABUF_DESC_DXR         ((XrStructureType)1004999241)
+#define XR_TYPE_WEAVE_OVERLAY_DMABUF_DESC_DXR ((XrStructureType)1004999242)
+#define XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR       ((XrStructureType)1004999243)
+#define XR_TYPE_WEAVE_SUBMIT_SYNC_DXR         ((XrStructureType)1004999244)
+#define XR_TYPE_WEAVE_OUTPUT_SYNC_DXR         ((XrStructureType)1004999245)
+// Spec v11 (#1723): bulk grid snap.
+#define XR_TYPE_WEAVE_SNAP_GRID_INFO_DXR      ((XrStructureType)1004999246)
+// Spec v12 (browser-pvt#180): woven origin per output, for present-owner move sync.
+#define XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR         ((XrStructureType)1004999247)
+#define XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR ((XrStructureType)1004999248)
+// Spec v13: one flat view instead of the weave while the panel is in hardware 2D.
+// Last value of the 240..249 decade.
+#define XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR     ((XrStructureType)1004999249)
+
+// Reserved 1004999290..299 — the third weave decade (240..249 is full). Same registry.
+// Spec v14 (ADR-027 Amendment): the overlay atlas is unchanged since the last submit.
+#define XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR ((XrStructureType)1004999290)
+// Spec v15 (ADR-027 Amendment): the caller's lens-filter strength for the 2D layer.
+#define XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR    ((XrStructureType)1004999291)
+// Spec v19 (#1884): per-screen parts of each weave rect + per-screen eyes.
+#define XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR        ((XrStructureType)1004999292)
 
 //! Upper bound on eye positions carried by XrWeaveSubmitInfoDXR (mirrors the
 //! runtime's XRT_MAX_VIEWS). Phase 1: carried but unused.
@@ -225,6 +416,15 @@ extern "C" {
 //! runtime's IPC message stays within its fixed buffer). Callers with more
 //! visible elements split into multiple batched submits.
 #define XR_WEAVE_SUBMIT_MAX_RECTS_DXR 32
+
+//! Upper bound on the per-screen segments one XrWeaveOutputRectPartsDXR reports
+//! (spec v19; mirrors the runtime's XRT_MAX_SEGMENTS). A window across more
+//! screens than this is reported unsegmented (segmentCount 0).
+#define XR_WEAVE_MAX_SEGMENTS_DXR 2
+
+//! Upper bound on rect parts one XrWeaveOutputRectPartsDXR reports (spec v19):
+//! every submitted rect split at every seam.
+#define XR_WEAVE_MAX_RECT_PARTS_DXR (XR_WEAVE_SUBMIT_MAX_RECTS_DXR * XR_WEAVE_MAX_SEGMENTS_DXR)
 
 //! Upper bound on flat rects carried by one XrWeaveSubmitFlatRegionsDXR (spec
 //! v8). Smaller than XR_WEAVE_SUBMIT_MAX_RECTS_DXR on purpose: the flat list
@@ -240,6 +440,23 @@ extern "C" {
 
 //! Upper bound on rects passed to xrWeaveSetScreenFlatRegionsDXR (spec v8).
 #define XR_WEAVE_SET_MAX_SCREEN_FLAT_RECTS_DXR 8
+
+//! Upper bound on memory planes one dma-buf descriptor carries (spec v10). All
+//! planes are offsets into the ONE fd; 4 is the DRM ceiling (Intel CCS modifiers
+//! use 2 for a single-plane RGB format).
+#define XR_WEAVE_DMABUF_MAX_PLANES_DXR 4
+
+//! Upper bound on points one xrWeaveSnapWindowGridDXR evaluates (spec v11), and
+//! on points along either axis. 1024 x 1024 covers a dense device-pixel grid
+//! over a whole drag-lattice table at any output scale the panel is driven at;
+//! the reply is 2 bytes per point.
+#define XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR (1024u * 1024u)
+#define XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR   1024u
+
+//! XrWeaveSnapGridPointDXR value (in BOTH fields) for a point whose snapped
+//! displacement does not fit int8 — never produced by a correct snap, which
+//! stays within a few pixels of its target (spec v11).
+#define XR_WEAVE_SNAP_GRID_NO_DELTA_DXR (-128)
 
 /*!
  * @brief Per-frame weave submission for one window sub-rect.
@@ -290,7 +507,8 @@ typedef struct XrWeaveSubmitInfoDXR {
  * @c XR_WEAVE_HANDLE_KIND_PLATFORM_DEFAULT_DXR keeps every pre-v7 caller correct
  * byte-for-byte: the runtime resolves it to the platform's native kind (Windows:
  * NT handle, or legacy DXGI when @c inputIsDxgi / @c overlayIsDxgi is XR_TRUE;
- * macOS: IOSurface; Android: AHardwareBuffer).
+ * macOS: IOSurface; Android: AHardwareBuffer; desktop Linux: OPAQUE_FD, unless an
+ * XrWeaveDmabufDescDXR is chained, which selects DMABUF).
  */
 typedef enum XrWeaveHandleKindDXR {
     //! Resolve from the platform (+ the inputIsDxgi / overlayIsDxgi bit on Windows).
@@ -303,6 +521,16 @@ typedef enum XrWeaveHandleKindDXR {
     XR_WEAVE_HANDLE_KIND_IOSURFACE_DXR = 3,
     //! Android: AHardwareBuffer* (the buffer itself travels over the IPC socket).
     XR_WEAVE_HANDLE_KIND_AHARDWAREBUFFER_DXR = 4,
+    //! Desktop Linux (spec v10): a dma-buf described by a chained
+    //! XrWeaveDmabufDescDXR (input) / XrWeaveOverlayDmabufDescDXR (overlay); the
+    //! texture field itself is ignored. Any producer, any driver.
+    XR_WEAVE_HANDLE_KIND_DMABUF_DXR = 5,
+    //! Desktop Linux (spec v10): a Vulkan OPAQUE_FD memory export from the SAME
+    //! driver and device as the runtime, passed as (void*)(intptr_t)fd in the
+    //! texture field. Carries no format or tiling, so it only works between two
+    //! Vulkan instances that agree on both; what PLATFORM_DEFAULT resolves to on
+    //! desktop Linux (the pre-v10 behaviour there). Prefer DMABUF.
+    XR_WEAVE_HANDLE_KIND_OPAQUE_FD_DXR = 6,
     XR_WEAVE_HANDLE_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrWeaveHandleKindDXR;
 
@@ -318,8 +546,9 @@ typedef enum XrWeaveHandleKindDXR {
  * Sync note (v7): Android adopts the macOS contract — the caller completes its
  * GPU writes into @c inputTexture BEFORE calling xrWeaveSubmitDXR, and the call
  * RETURNS only once the woven output is GPU-complete (XrWeaveOutputDXR::fence
- * stays NULL, @c fenceValue is a plain monotonic counter). An fd-based
- * (`sync_file`) acquire/release variant is a documented follow-up; it is a
+ * stays NULL, @c fenceValue is a plain monotonic counter). The fd-based
+ * (`sync_file`) acquire/release variant is v10's XrWeaveSubmitSyncDXR /
+ * XrWeaveOutputSyncDXR — desktop Linux from v10, Android from v20; it is a
  * latency optimisation, never a correctness requirement.
  */
 typedef struct XrWeaveSubmitHandlesDXR {
@@ -482,6 +711,12 @@ typedef struct XrWeaveSubmitFlatRegionsDXR {
  * and the caller reuses the handles it already opened. @c width, @c height and
  * @c fenceValue are valid on every call. The caller owns the returned HANDLEs
  * and must CloseHandle() them when done.
+ *
+ * Desktop Linux (v10): chain an XrWeaveOutputDmabufDXR to receive the woven
+ * output as a typed dma-buf, and an XrWeaveOutputSyncDXR to receive a per-frame
+ * release fence; @c fence is never set there. Android (v20): chain an
+ * XrWeaveOutputSyncDXR for the same per-frame release fence. Without the dma-buf chain an
+ * OPAQUE_FD export rides @c weavedTexture as (void*)(intptr_t)fd.
  */
 typedef struct XrWeaveOutputDXR {
     XrStructureType    type;          //!< XR_TYPE_WEAVE_OUTPUT_DXR
@@ -580,6 +815,447 @@ typedef struct XrWeaveIpcConnectionDXR {
     int32_t            fd;     //!< POSIX: connected socket fd; -1 on Windows
 } XrWeaveIpcConnectionDXR;
 
+/*!
+ * @brief The submit's INPUT as a dma-buf (spec v10, desktop Linux, #1699).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. Its presence selects the DMABUF handle
+ * kind for the input (an XrWeaveSubmitHandlesDXR, if also chained, must say
+ * DMABUF or PLATFORM_DEFAULT); XrWeaveSubmitInfoDXR::inputTexture is ignored.
+ * Every other input-layout rule (v3 batch, v6 N-view atlas) is unchanged — this
+ * says only what the pixels ARE and where they live.
+ *
+ * The values are what the producer's allocator reports (`gbm_bo_get_*`, EGL
+ * `eglExportDMABUFImageMESA`, Chromium's `gfx::NativePixmapHandle`), passed
+ * through verbatim:
+ *
+ *  - @c fd — the dma-buf (>= 0). All planes are offsets into this ONE fd.
+ *    OWNERSHIP: the runtime's once xrWeaveSubmitDXR returns XR_SUCCESS (it closes
+ *    it); still the caller's on any other result. A caller that wants to keep
+ *    the buffer passes a dup().
+ *  - @c drmFourcc — DRM_FORMAT_* code (e.g. DRM_FORMAT_ABGR8888 for RGBA8 bytes).
+ *  - @c drmModifier — DRM format modifier, verbatim. DRM_FORMAT_MOD_INVALID
+ *    (0x00ffffffffffffff, "implicit") is rejected: resolve it first (LINEAR = 0).
+ *  - @c planeCount — 1..XR_WEAVE_DMABUF_MAX_PLANES_DXR (memory planes, including
+ *    a modifier's auxiliary planes); @c offsets / @c strides beyond it are ignored.
+ *  - @c bufferId — a caller-chosen STABLE identity for the underlying buffer, 0 =
+ *    none. An fd is not an identity (every hand-off is a new number), so the
+ *    runtime keys its import cache on this when non-zero and on the fd's inode
+ *    otherwise; a producer rotating a small pool should set it, so a steady
+ *    stream re-uses imports instead of re-importing every frame. Two different
+ *    buffers must never share a non-zero id within one session.
+ */
+typedef struct XrWeaveDmabufDescDXR {
+    XrStructureType          type;        //!< XR_TYPE_WEAVE_DMABUF_DESC_DXR
+    const void* XR_MAY_ALIAS next;
+    int32_t                  fd;          //!< dma-buf fd; runtime-owned on XR_SUCCESS
+    uint32_t                 width;       //!< pixels
+    uint32_t                 height;      //!< pixels
+    uint32_t                 drmFourcc;   //!< DRM_FORMAT_* fourcc
+    uint64_t                 drmModifier; //!< DRM format modifier (never DRM_FORMAT_MOD_INVALID)
+    uint32_t                 planeCount;  //!< 1..XR_WEAVE_DMABUF_MAX_PLANES_DXR
+    uint32_t                 offsets[XR_WEAVE_DMABUF_MAX_PLANES_DXR]; //!< per-plane byte offset into @c fd
+    uint32_t                 strides[XR_WEAVE_DMABUF_MAX_PLANES_DXR]; //!< per-plane row pitch, bytes
+    uint64_t                 bufferId;    //!< stable caller identity of the buffer; 0 = none
+} XrWeaveDmabufDescDXR;
+
+/*!
+ * @brief The OVERLAY atlas as a dma-buf (spec v10, desktop Linux, #1699).
+ *
+ * Field-for-field identical to XrWeaveDmabufDescDXR; a separate structure type
+ * only because one next chain carries both and a structure type may appear in a
+ * chain once. Chain onto XrWeaveSubmitInfoDXR::next together with the
+ * XrWeaveSubmitOverlaysDXR it describes (whose @c overlayTexture is then
+ * ignored). Required when the input is a dma-buf and an overlay is submitted;
+ * rejected when the input is not a dma-buf. Same ownership rule.
+ */
+typedef struct XrWeaveOverlayDmabufDescDXR {
+    XrStructureType          type;        //!< XR_TYPE_WEAVE_OVERLAY_DMABUF_DESC_DXR
+    const void* XR_MAY_ALIAS next;
+    int32_t                  fd;
+    uint32_t                 width;
+    uint32_t                 height;
+    uint32_t                 drmFourcc;
+    uint64_t                 drmModifier;
+    uint32_t                 planeCount;
+    uint32_t                 offsets[XR_WEAVE_DMABUF_MAX_PLANES_DXR];
+    uint32_t                 strides[XR_WEAVE_DMABUF_MAX_PLANES_DXR];
+    uint64_t                 bufferId;
+} XrWeaveOverlayDmabufDescDXR;
+
+/*!
+ * @brief The woven output as a dma-buf (spec v10, desktop Linux, #1699).
+ *
+ * Chain onto XrWeaveOutputDXR::next. Same LIFETIME as @c weavedTexture: filled on
+ * the first successful xrWeaveSubmitDXR and again whenever the output is
+ * reallocated (@c width / @c height change); on every other frame @c fd is -1 and
+ * the caller keeps using the buffer it already imported. The caller OWNS a
+ * returned fd and closes it when done (after importing it, typically).
+ *
+ * @c size is the whole allocation in bytes (what a Vulkan importer passes as
+ * VkMemoryAllocateInfo::allocationSize). On a platform or path that exports no
+ * dma-buf the runtime writes @c fd = -1 and leaves the rest zero, so a portable
+ * caller may always chain it.
+ */
+typedef struct XrWeaveOutputDmabufDXR {
+    XrStructureType    type;        //!< XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR
+    void* XR_MAY_ALIAS next;
+    int32_t            fd;          //!< woven dma-buf (caller-owned), or -1 on steady-state frames
+    uint32_t           width;
+    uint32_t           height;
+    uint32_t           drmFourcc;
+    uint64_t           drmModifier;
+    uint32_t           planeCount;
+    uint32_t           offsets[XR_WEAVE_DMABUF_MAX_PLANES_DXR];
+    uint32_t           strides[XR_WEAVE_DMABUF_MAX_PLANES_DXR];
+    uint64_t           size;        //!< total allocation size in bytes
+} XrWeaveOutputDmabufDXR;
+
+/*!
+ * @brief Acquire fence for a submit (spec v10 desktop Linux, #1699; spec v20 Android).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next. Desktop Linux: alongside an
+ * XrWeaveDmabufDescDXR (it is rejected without one). Android (v20): on an
+ * AHardwareBuffer submit, no descriptor. @c acquireFenceFd is a sync_file that signals when the
+ * caller's GPU has finished WRITING the input (and overlay) AND finished READING
+ * the previous woven output — one fence covers both hazards. The runtime waits it
+ * on the GPU before it touches either, so the caller need not finish its GPU work
+ * before submitting. -1 = no fence: the caller has already finished (the v9
+ * contract). Ownership as XrWeaveDmabufDescDXR::fd.
+ */
+typedef struct XrWeaveSubmitSyncDXR {
+    XrStructureType          type;           //!< XR_TYPE_WEAVE_SUBMIT_SYNC_DXR
+    const void* XR_MAY_ALIAS next;
+    int32_t                  acquireFenceFd; //!< sync_file fd, or -1 = none
+} XrWeaveSubmitSyncDXR;
+
+/*!
+ * @brief Release fence for this frame's woven output (spec v10 desktop Linux, v20 Android).
+ *
+ * Chain onto XrWeaveOutputDXR::next. Unlike the woven dma-buf (once per
+ * allocation) this is PER FRAME: every successful xrWeaveSubmitDXR writes a fresh
+ * @c releaseFenceFd, a sync_file that signals when the woven output of THIS
+ * submit is complete. The caller owns it, waits it (GPU import or poll) before
+ * sampling the output, and closes it. -1 means the submit already completed
+ * synchronously — the output is ready now.
+ *
+ * Without this chain the runtime keeps the v9 contract for the caller: it waits
+ * the release fence itself before xrWeaveSubmitDXR returns. @c fenceValue stays a
+ * monotonic per-submit counter either way. Harmless on every platform — where
+ * there is no sync_file the runtime writes -1.
+ */
+typedef struct XrWeaveOutputSyncDXR {
+    XrStructureType    type;           //!< XR_TYPE_WEAVE_OUTPUT_SYNC_DXR
+    void* XR_MAY_ALIAS next;
+    int32_t            releaseFenceFd; //!< sync_file fd (caller-owned), or -1 = already complete
+} XrWeaveOutputSyncDXR;
+
+/*!
+ * @brief A grid of drag targets around one drag origin (spec v11, #1723).
+ *
+ * Input of xrWeaveSnapWindowGridDXR. Point (i, j), i < @c countX, j < @c countY,
+ * proposes the window top-left
+ *
+ *   (firstTarget.x + i * step.width, firstTarget.y + j * step.height)
+ *
+ * and is snapped from @c originRect exactly as xrWeaveSnapWindowRectDXR would
+ * snap it: same frame rules (any frame, as long as origin and targets share it;
+ * DEVICE pixels, never logical ones), only the offset is snapped.
+ *
+ * @c step components are >= 1; @c countX and @c countY are
+ * 1..XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR with a product of at most
+ * XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR; every target must stay within ±2^28 px.
+ */
+typedef struct XrWeaveSnapGridInfoDXR {
+    XrStructureType          type;        //!< XR_TYPE_WEAVE_SNAP_GRID_INFO_DXR
+    const void* XR_MAY_ALIAS next;
+    XrRect2Di                originRect;  //!< drag-start window rect (offset used; extent passes through)
+    XrOffset2Di              firstTarget; //!< proposed top-left of grid point (0, 0)
+    XrExtent2Di              step;        //!< grid pitch, device px, each >= 1
+    uint32_t                 countX;      //!< points along x
+    uint32_t                 countY;      //!< points along y
+} XrWeaveSnapGridInfoDXR;
+
+/*!
+ * @brief One grid point's answer (spec v11): the snapped top-left MINUS the
+ * proposed one, in device px. (0, 0) = the DP accepts the target as is.
+ *
+ * Both fields are XR_WEAVE_SNAP_GRID_NO_DELTA_DXR when the displacement does
+ * not fit int8; a caller that needs that point asks xrWeaveSnapWindowRectDXR.
+ */
+typedef struct XrWeaveSnapGridPointDXR {
+    int8_t dx;
+    int8_t dy;
+} XrWeaveSnapGridPointDXR;
+
+/*!
+ * @brief The caller's LOGICAL window origin, beside its device-pixel geometry
+ * (spec v12, browser-pvt#180).
+ *
+ * Chain onto XrWeaveBindWindowInfoDXR::next together with an
+ * XrWeaveWindowGeometryDXR (it is XR_ERROR_VALIDATION_FAILURE without one). It
+ * states the quantity a Wayland move-sync tag encodes: the top-left of the
+ * surface the caller presents the woven output in, in the compositor's global
+ * LOGICAL layout (mutter stage px — what the window-geometry@displayxr.org GNOME
+ * extension publishes), and @c scale, the output scale the caller converted it to
+ * XrWeaveWindowGeometryDXR::windowOriginOnScreen with.
+ *
+ * The runtime stores the pair VERBATIM, latched with the device-pixel geometry of
+ * the same bind, and echoes it in XrWeaveOutputOriginDXR::wovenOriginLogical /
+ * logicalScale for every output woven under that bind. It performs no conversion
+ * in either direction. A bind WITHOUT this struct clears the latch (the logical
+ * origin of the new geometry is unknown), so XrWeaveOutputOriginDXR::logicalValid
+ * is XR_FALSE until the next bind that carries one.
+ *
+ * Accepted on every platform; only desktop Linux reports it back today (the only
+ * platform with a logical coordinate space the drag protocol uses).
+ */
+typedef struct XrWeaveWindowLogicalOriginDXR {
+    XrStructureType          type;          //!< XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR
+    const void* XR_MAY_ALIAS next;
+    XrOffset2Di              logicalOrigin; //!< surface top-left, compositor-global LOGICAL px (y-down)
+    float                    scale;         //!< output scale used for logical -> device px; finite, > 0
+} XrWeaveWindowLogicalOriginDXR;
+
+/*!
+ * @brief The origin one woven output was woven for (spec v12, browser-pvt#180).
+ *
+ * Chain onto XrWeaveOutputDXR::next. Unlike the woven dma-buf (once per
+ * allocation) this is PER FRAME: every successful xrWeaveSubmitDXR rewrites it
+ * for the output that submit produced — the output the caller samples after
+ * waiting that submit's release fence.
+ *
+ * WHICH ORIGIN. The one the WEAVE used: the window geometry the runtime handed
+ * the display processor's phase slot when it ran this submit's weave, captured
+ * inside the weave under the lock that serialises it against
+ * xrWeaveBindWindow2DXR — the same per-weave snapshot the in-process Wayland
+ * compositor tags its own commits from. Today the weave runs synchronously
+ * within xrWeaveSubmitDXR, so it is also the geometry of the last
+ * xrWeaveBindWindow2DXR that returned before the submit; the contract is the
+ * weave-time one, so a later runtime that weaves asynchronously keeps it.
+ *
+ *  - @c valid: XR_TRUE when a geometry (XrWeaveWindowGeometryDXR) was bound when
+ *    this output was woven. XR_FALSE = display-scoped weave, nothing to tag with;
+ *    every origin field is then 0.
+ *  - @c wovenOriginOnScreen: that geometry's windowOriginOnScreen — absolute
+ *    physical px, y-down, the same space as
+ *    XrWeaveWindowGeometryDXR::windowOriginOnScreen. Echoed, not recomputed.
+ *  - @c logicalValid: XR_TRUE when that same bind carried an
+ *    XrWeaveWindowLogicalOriginDXR. Implies @c valid.
+ *  - @c wovenOriginLogical / @c logicalScale: that struct's logicalOrigin /
+ *    scale, VERBATIM (no conversion is ever applied — see
+ *    XrWeaveWindowLogicalOriginDXR). 0 when @c logicalValid is XR_FALSE.
+ *  - @c serial: increases by at least 1 with every woven output of this session
+ *    (first output >= 1); 0 when the path reports no origin at all. Two outputs
+ *    with the same serial are the same output.
+ *
+ * THE TAG. A move-synchronised present-owner tags the commit that presents this
+ * output with (wovenOriginLogical.x mod 256, wovenOriginLogical.y mod 256),
+ * non-negative modulo — docs/specs/runtime/wayland-window-geometry.md §9. The
+ * modulus is the extension's MOVE_SYNC_TAG_MOD and the runtime's
+ * COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD; it is deliberately not part of this API.
+ * Tag only when @c logicalValid.
+ *
+ * Filled on the desktop-Linux dma-buf submit path (XrWeaveDmabufDescDXR), and on
+ * the Windows D3D11 service while the caller's weave display processor is
+ * windowless (the service then phases it from its own read of the bound window;
+ * @c logicalValid stays XR_FALSE). Every other path of a v12 runtime writes
+ * @c valid = @c logicalValid = XR_FALSE and @c serial = 0, so a portable caller
+ * may always chain it. A runtime older than
+ * v12 never touches the struct: zero-initialise it (or check the enabled
+ * extension's spec version) so an untouched struct reads as "not reported".
+ */
+typedef struct XrWeaveOutputOriginDXR {
+    XrStructureType    type;                //!< XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR
+    void* XR_MAY_ALIAS next;
+    XrBool32           valid;               //!< a geometry was bound for this output's weave
+    XrOffset2Di        wovenOriginOnScreen; //!< absolute physical px (y-down), as XrWeaveWindowGeometryDXR
+    XrBool32           logicalValid;        //!< the bind also carried XrWeaveWindowLogicalOriginDXR
+    XrOffset2Di        wovenOriginLogical;  //!< that bind's logicalOrigin, verbatim (logical px)
+    float              logicalScale;        //!< that bind's scale, verbatim
+    uint64_t           serial;              //!< monotonic per woven output; 0 = not reported
+} XrWeaveOutputOriginDXR;
+
+/*!
+ * @brief Spec v13: present ONE flat view instead of the weave while the panel is
+ *        in hardware 2D (chain on XrWeaveSubmitInfoDXR::next).
+ *
+ * xrRequestDisplayModeDXR is hardware-only (XR_DXR_display_info): a 2D request
+ * over woven content turns the lens off and keeps the weave running, so the
+ * panel shows every view interlaced through no lens — soft and doubled. Apps
+ * rely on that for transitions that fade parallax to zero. A present-owner that
+ * drops the lens for a reason of its OWN (a browser holding the panel 2D while
+ * one of its menus is open) wants the opposite: the content flat and sharp.
+ *
+ * With @c monoIn2D XR_TRUE, and while THIS session's hardware display state is
+ * 2D (the last state the runtime confirmed to it — the one its
+ * XrEventDataHardwareDisplayStateChangedDXR events report), the runtime skips
+ * the weave and paints the whole output with ONE view of the submitted content
+ * at full output resolution, in register with the window — the same view the
+ * off-panel 2D bands use (§5d), so the two flat paths match: for a stereo pair
+ * (every batch submit, and a 2-view v6 layout) view 0, the LEFT view — a batch
+ * rect's left half, unsqueezed; for a v6 layout of more than two views, the
+ * view whose eye is nearest the display axis (smallest |x| of the per-view eye
+ * offset). Flat regions and the v4 overlay are applied on top as usual. Mono
+ * follows the runtime's display-processor-CONFIRMED hardware-2D state for this
+ * session, not the request: it starts on the first submit after the 2D state
+ * is confirmed and ends on the first submit after the confirmed state is 3D
+ * again. While the hardware state is 3D the struct has no effect, so a
+ * caller can chain it for the whole of its own 2D hold without racing the
+ * lens: the output is flat exactly while the runtime holds the panel 2D, and a
+ * request the display processor rejected keeps the weave.
+ *
+ * Per submit, no latch: omitting the struct (or @c monoIn2D XR_FALSE) is the
+ * pre-v13 behaviour. Nothing is reported to the session — no rendering-mode
+ * event, no change to the active mode or to xrLocateViews.
+ *
+ * Honoured by the desktop-Linux weave engine. Every other platform of a v13
+ * runtime accepts and ignores it (the output stays woven), as a pre-v13 runtime
+ * does with any unknown chained struct.
+ */
+typedef struct XrWeaveSubmitMonoIn2DDXR {
+    XrStructureType          type;     //!< XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR
+    const void* XR_MAY_ALIAS next;
+    XrBool32                 monoIn2D; //!< XR_TRUE: one view flat, no weave, while hardware is 2D
+} XrWeaveSubmitMonoIn2DDXR;
+
+/*!
+ * @brief The v4 overlay atlas is UNCHANGED since the previous submit (spec v14).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next, in the same submit as an
+ * XrWeaveSubmitOverlaysDXR. @c overlayUnchanged XR_TRUE declares that the overlay
+ * texture holds exactly the pixels it held for the previous ACCEPTED submit that
+ * chained it — same texture, same size, no writes since. The runtime may then
+ * reuse work derived from it: a display processor that band-limits the 2D layer
+ * for its lens (ADR-027 Amendment) skips re-filtering a static page, which is
+ * what makes a whole-page overlay affordable on integrated GPUs.
+ *
+ * Advisory, per submit, no latch: omitting the struct, or XR_FALSE, means
+ * "may have changed" — always correct, only slower. Declaring XR_TRUE for an
+ * atlas that DID change may show the previous 2D content for that frame; a
+ * runtime still re-derives on its own when the texture or its size changes, or
+ * when the viewer moves enough to matter. Content-only: the overlay is composited
+ * every frame either way.
+ *
+ * A pre-v14 runtime ignores the struct (unknown chained struct), which is the
+ * "may have changed" behaviour. No version gate is needed to send it.
+ */
+typedef struct XrWeaveSubmitOverlayUnchangedDXR {
+    XrStructureType          type;             //!< XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR
+    const void* XR_MAY_ALIAS next;
+    XrBool32                 overlayUnchanged; //!< XR_TRUE: same overlay pixels as the previous accepted submit
+} XrWeaveSubmitOverlayUnchangedDXR;
+
+/*!
+ * @brief Lens-filter strength for the v4 overlay atlas (spec v15).
+ *
+ * Chain onto XrWeaveSubmitInfoDXR::next, in the same submit as an
+ * XrWeaveSubmitOverlaysDXR. A display processor that band-limits the 2D layer
+ * for its lens (ADR-027 Amendment) trades aliasing against softness; this sets
+ * where on that curve THIS submit sits:
+ *
+ *   0.0 — no lens filtering (the layer is composited as-is: sharpest, aliases)
+ *   1.0 — the display processor's full anti-aliasing filter (softest)
+ *
+ * Omitting the struct selects the DISPLAY PROCESSOR's default, a vendor-tuned
+ * value chosen by eye on its panel (Leia SR ships 0.6). That is the right choice
+ * for a caller that does not know its content better; set it only to tune for
+ * known content (text/UI wants more filtering, photos/video can take less).
+ *
+ * Per submit, no latch. @c filterStrength outside [0,1] or NaN is
+ * XR_ERROR_VALIDATION_FAILURE. A display processor without a strength control
+ * ignores it, as does a pre-v15 runtime (unknown chained struct) — both behave
+ * as the default, so no version gate is needed to send it.
+ */
+typedef struct XrWeaveSubmitOverlayFilterDXR {
+    XrStructureType          type;           //!< XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR
+    const void* XR_MAY_ALIAS next;
+    float                    filterStrength; //!< 0 = no lens filtering .. 1 = full; omit = DP default
+} XrWeaveSubmitOverlayFilterDXR;
+
+/*!
+ * @brief One screen's segment of the bound window (spec v19, #1884).
+ *
+ * The part of the window's client area that lands on one screen, the display
+ * processor that weaves it, and that screen's viewer. @c eyes are in THAT
+ * screen's display space (metres, origin at the screen's centre, the same
+ * convention XrWeaveOutputDXR::eyes use for the primary screen), so an
+ * off-axis projection for this segment is built against THIS screen's
+ * physical rectangle (@c screenSizeMeters), with the part's position on it
+ * taken from XrWeaveRectPartDXR::screenRect.
+ *
+ * @c woven is XR_FALSE when the runtime cannot weave this segment (the screen
+ * has no display processor, or its DP needs 1:1 pixels on a resampled screen):
+ * the runtime then shows one view of it flat (the left view of a stereo pair;
+ * the middle view of an N-view atlas) and @c eyesValid is usually XR_FALSE.
+ */
+typedef struct XrWeaveScreenSegmentDXR {
+    uint64_t    displayId;        //!< the screen (XrDisplayDXR::displayId, XR_DXR_display_info)
+    XrRect2Di   windowRect;       //!< window-and-screen intersection, window-relative device px (y-down)
+    XrRect2Di   screenRect;       //!< the same pixels, relative to the screen's own top-left
+    XrExtent2Di screenSize;       //!< the screen's size, device px
+    XrExtent2Df screenSizeMeters; //!< the screen's physical size, metres (0 = unknown)
+    XrBool32    isPrimary;        //!< the system-default screen (the one XrWeaveOutputDXR::eyes describe)
+    XrBool32    woven;            //!< XR_TRUE = woven in 3D by this screen's DP; XR_FALSE = one view, flat
+    uint32_t    eyeCount;
+    XrVector3f  eyes[XR_WEAVE_MAX_EYES_DXR]; //!< this screen's tracked eyes, THIS screen's display space
+    XrBool32    eyesValid;
+    XrBool32    eyesTracking;
+} XrWeaveScreenSegmentDXR;
+
+/*!
+ * @brief The part of one submitted weave rect that lands on one screen (spec v19).
+ *
+ * @c windowRect is the part in the window's space (the space of
+ * XrWeaveSubmitRectsDXR::rects); @c rectRelative is the same part relative to
+ * its rect's own top-left, i.e. where those pixels sit inside the rect's
+ * content (inside each SBS half, at full rect scale, on the batch layout);
+ * @c screenRect is the same part relative to its screen's top-left. The caller
+ * renders exactly @c rectRelative of rect @c rectIndex from
+ * segments[@c segmentIndex].eyes.
+ */
+typedef struct XrWeaveRectPartDXR {
+    uint32_t  rectIndex;    //!< index into the submitted XrWeaveSubmitRectsDXR::rects
+    uint32_t  segmentIndex; //!< index into XrWeaveOutputRectPartsDXR::segments
+    XrRect2Di windowRect;   //!< the part, window-relative device px
+    XrRect2Di rectRelative; //!< the part, relative to the rect's top-left
+    XrRect2Di screenRect;   //!< the part, relative to the screen's top-left
+} XrWeaveRectPartDXR;
+
+/*!
+ * @brief Per-screen segments and per-screen rect parts of a submit (spec v19, #1884).
+ *
+ * Chain onto XrWeaveOutputDXR::next (zero-initialised). Every successful
+ * xrWeaveSubmitDXR fills it with what THIS submit's weave did:
+ *
+ *  - @c segmentCount 0: the window was woven by one display processor (it is
+ *    on one screen, the submit used the legacy single-rect layout, or the
+ *    system has one 3D screen). The base XrWeaveOutputDXR::eyes apply to every
+ *    rect and @c partCount is 0. This is every pre-v19 frame.
+ *  - @c segmentCount >= 1: the window was woven per screen. @c segments lists
+ *    the window's screens left to right, each with its own eyes; @c parts lists
+ *    every non-empty (rect, segment) intersection, ordered by rect, then left to
+ *    right. A rect wholly on one screen has exactly one part covering all of it.
+ *    Render each part from its segment's eyes for the NEXT frame (the same
+ *    one-frame lag the base eyes have). The base eyes still describe the
+ *    primary screen.
+ *
+ * @c generation changes whenever the segment geometry changes (a move, a
+ * resize, a screen change) and not when only the eyes do, so a caller can
+ * re-plan its per-part render targets on a change only.
+ *
+ * The parts are computed for the rects of THIS submit, in submission order; a
+ * frame split across several submits gets each submit's parts separately.
+ */
+typedef struct XrWeaveOutputRectPartsDXR {
+    XrStructureType         type; //!< XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR
+    void* XR_MAY_ALIAS      next;
+    uint32_t                segmentCount; //!< 0 = not segmented (use XrWeaveOutputDXR::eyes)
+    XrWeaveScreenSegmentDXR segments[XR_WEAVE_MAX_SEGMENTS_DXR];
+    uint32_t                partCount;
+    XrWeaveRectPartDXR      parts[XR_WEAVE_MAX_RECT_PARTS_DXR];
+    uint64_t                generation; //!< bumped on a segment-geometry change
+} XrWeaveOutputRectPartsDXR;
+
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveBindWindowDXR)(
     XrSession session, void* windowHandle);
 
@@ -594,6 +1270,10 @@ typedef XrResult (XRAPI_PTR *PFN_xrWeaveSubmitDXR)(
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveSnapWindowRectDXR)(
     XrSession session, const XrRect2Di* originRect, const XrRect2Di* targetRect, XrRect2Di* snappedRect);
+
+typedef XrResult (XRAPI_PTR *PFN_xrWeaveSnapWindowGridDXR)(
+    XrSession session, const XrWeaveSnapGridInfoDXR* gridInfo, uint32_t pointCapacityInput,
+    uint32_t* pointCountOutput, XrWeaveSnapGridPointDXR* points, XrBool32* declined);
 
 typedef XrResult (XRAPI_PTR *PFN_xrWeaveSetScreenFlatRegionsDXR)(
     XrSession session, uint32_t rectCount, const XrRect2Di* screenRects);
@@ -636,6 +1316,32 @@ XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSubmitDXR(
 //! in-process session.
 XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSnapWindowRectDXR(
     XrSession session, const XrRect2Di* originRect, const XrRect2Di* targetRect, XrRect2Di* snappedRect);
+
+//! Snap a whole GRID of proposed window positions in one call (spec v11,
+//! #1723) — xrWeaveSnapWindowRectDXR evaluated at every point of @c gridInfo,
+//! by the runtime, next to the display processor. For a caller that needs the
+//! answer set rather than one answer: the Wayland drag lattice probes a
+//! 129 x 129 grid at every title-bar press, which per point is one service
+//! round trip each over IPC (~2.4 s measured); this is one.
+//!
+//! Standard two-call idiom: @c pointCapacityInput 0 writes the point count
+//! (countX * countY) to @c pointCountOutput and evaluates nothing; otherwise
+//! @c points must hold that many (XR_ERROR_SIZE_INSUFFICIENT if not) and
+//! receives them row-major — point (i, j) at index j * countX + i.
+//!
+//! @c declined (optional, may be NULL) is set XR_TRUE when the display
+//! processor produced no snap — no snap support, no usable viewing distance
+//! yet, not up yet: the per-point call's identity case. Every point is then
+//! (0, 0), so ignoring the flag degrades exactly like the per-point call; a
+//! caller that honours it drags unconstrained, since there is no phase to
+//! protect.
+//!
+//! GPU-free and synchronous. Available wherever xrWeaveSnapWindowRectDXR is
+//! (including an in-process desktop-Linux session); reports
+//! XR_ERROR_FEATURE_UNSUPPORTED exactly where it does.
+XRAPI_ATTR XrResult XRAPI_CALL xrWeaveSnapWindowGridDXR(
+    XrSession session, const XrWeaveSnapGridInfoDXR* gridInfo, uint32_t pointCapacityInput,
+    uint32_t* pointCountOutput, XrWeaveSnapGridPointDXR* points, XrBool32* declined);
 
 //! Latch the regions of the PANEL that must stay physically flat (spec v8,
 //! browser#88). Sticky companion to XrWeaveSubmitFlatRegionsDXR: same advisory

@@ -8,7 +8,7 @@
 // assignment. Extension names are expected to be stable; numeric values are
 // not. SPEC_VERSION continues the pre-rename XR_EXT_* numbering (the
 // interface history did not restart with the name).
-// See GOVERNANCE.md.
+// See GOVERNANCE.md in https://github.com/DisplayXR/displayxr-extensions.
 //
 /*!
  * @file
@@ -45,14 +45,17 @@ extern "C" {
 #endif
 
 #define XR_DXR_cocoa_window_binding 1
-#define XR_DXR_cocoa_window_binding_SPEC_VERSION 6
+#define XR_DXR_cocoa_window_binding_SPEC_VERSION 8
 #define XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_cocoa_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
 // This should be replaced with an official Khronos-assigned value if the extension is standardized
 #define XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999004)
 
-// Window-space composition layer (shared with XR_DXR_win32_window_binding)
+// Window-space composition layer. Every window/surface binding extension
+// (win32, cocoa, xlib, wayland, android) enables it and declares it with this
+// SAME guarded block, so any combination of these headers can be included in
+// any order. The guard is the type value, shared by all five copies.
 #ifndef XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
 #define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR ((XrStructureType)1004999002)
 
@@ -61,8 +64,12 @@ extern "C" {
  *
  * Renders a textured quad at a position specified as fractions of the target
  * window dimensions. Coordinates automatically scale when the window is resized.
- * The same texture is composited into both eye views with a per-eye horizontal
- * shift controlled by the disparity parameter.
+ * The same texture is composited into every view with a per-eye horizontal
+ * shift controlled by the disparity parameter. The layer is composited before
+ * the display processor (it is woven like any other layer).
+ *
+ * Valid on a session created with a window/surface binding, on a session of a
+ * native compositor, and on an IPC (service) session.
  *
  * @extends XrFrameEndInfo (submitted as a composition layer)
  */
@@ -78,7 +85,7 @@ typedef struct XrCompositionLayerWindowSpaceDXR {
     float                       disparity;  //!< Horizontal shift, fraction of window width.
                                             //!< 0 = screen depth, negative = toward viewer
 } XrCompositionLayerWindowSpaceDXR;
-#endif
+#endif // XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
 
 /*!
  * @brief Structure passed in XrSessionCreateInfo::next chain to provide
@@ -99,14 +106,28 @@ typedef struct XrCompositionLayerWindowSpaceDXR {
  *
  * @extends XrSessionCreateInfo
  */
+/*!
+ * @brief Callback for offscreen readback mode (CPU fallback).
+ *
+ * DEPRECATED: new code must pass NULL. The runtime still honours it; no shipped
+ * consumer passes a non-NULL value. Shared by the win32 and cocoa bindings.
+ *
+ * @param pixels   Pointer to RGBA pixel data (width * height * 4 bytes)
+ * @param width    Image width in pixels
+ * @param height   Image height in pixels
+ * @param userdata Opaque pointer from readbackUserdata
+ */
+#ifndef XR_DXR_PFN_READBACK_CALLBACK_DEFINED
+#define XR_DXR_PFN_READBACK_CALLBACK_DEFINED 1
 typedef void (*PFN_xrReadbackCallback)(
     const uint8_t *pixels, uint32_t width, uint32_t height, void *userdata);
+#endif
 
 typedef struct XrCocoaWindowBindingCreateInfoDXR {
     XrStructureType          type;              //!< Must be XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR
     const void* XR_MAY_ALIAS next;              //!< Pointer to next structure in chain
     void*                    viewHandle;        //!< NSView* with CAMetalLayer backing, or NULL for offscreen
-    PFN_xrReadbackCallback   readbackCallback;  //!< Called with composited RGBA pixels (offscreen mode)
+    PFN_xrReadbackCallback   readbackCallback;  //!< DEPRECATED, pass NULL (offscreen CPU readback)
     void*                    readbackUserdata;   //!< Passed to readbackCallback
     void*                    sharedIOSurface;   //!< IOSurfaceRef for zero-copy Metal texture sharing, or NULL
     XrBool32                 transparentBackgroundEnabled; //!< When XR_TRUE, NSWindow + CAMetalLayer
@@ -119,6 +140,45 @@ typedef struct XrCocoaWindowBindingCreateInfoDXR {
                                                            //!< on macOS. (Sibling of
                                                            //!< XrWin32WindowBindingCreateInfoDXR.transparentBackgroundEnabled.)
 } XrCocoaWindowBindingCreateInfoDXR;
+
+// ---- Spec v8: window placement ownership (ADR-050) ----
+
+#define XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR ((XrStructureType)1004999330)
+
+typedef XrFlags64 XrCocoaWindowPlacementFlagsDXR;
+
+/*!
+ * The APP keeps its window's drag / resize: the runtime does not take the
+ * gesture over (see XrCocoaWindowPlacementInfoDXR).
+ */
+static const XrCocoaWindowPlacementFlagsDXR XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR = 0x00000001;
+
+/*!
+ * @brief Who owns the bound window's drag + resize (spec v8, ADR-050).
+ *
+ * By default (this structure absent, or no bit set) the runtime OWNS the
+ * window's placement for an in-process Metal session whose bound view is its
+ * window's contentView: a title-bar drag, an edge / corner resize and the
+ * zoom button are performed by the runtime, each step phase-snapped by the
+ * display processor and applied in the same Core Animation transaction as
+ * the frame woven for it, so a lenticular weave never shows a stale or
+ * off-phase frame while the window moves. The runtime makes the window
+ * non-movable for AppKit (`movable = NO`) and installs a forwarding proxy as
+ * its delegate (the app's delegate keeps receiving every message; compare
+ * delegates with -isEqual:, not ==).
+ *
+ * Chain this structure on XrCocoaWindowBindingCreateInfoDXR::next with
+ * XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR to keep AppKit's native
+ * drag / resize — e.g. an app with its own window-management UI. Such an app
+ * can still snap its own moves with xrWeaveSnapWindowRectDXR (XR_DXR_weave).
+ *
+ * @extends XrCocoaWindowBindingCreateInfoDXR
+ */
+typedef struct XrCocoaWindowPlacementInfoDXR {
+    XrStructureType                type;   //!< Must be XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR
+    const void* XR_MAY_ALIAS       next;   //!< Pointer to next structure in chain
+    XrCocoaWindowPlacementFlagsDXR flags;  //!< XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR or 0
+} XrCocoaWindowPlacementInfoDXR;
 
 #ifdef __cplusplus
 }
