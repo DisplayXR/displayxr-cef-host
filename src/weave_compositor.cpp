@@ -694,6 +694,17 @@ WeaveCompositor::CompositeLegacy(XrSession session,
 	return wove;
 }
 
+void
+WeaveCompositor::OnResize()
+{
+	back_rtv_.Reset();
+	if (context_) {
+		context_->OMSetRenderTargets(0, nullptr, nullptr);
+		context_->Flush();
+	}
+	have_handback_ = false;
+}
+
 bool
 WeaveCompositor::Frame(XrSession session,
                        IDXGISwapChain1 *swapchain,

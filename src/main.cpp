@@ -501,15 +501,27 @@ RunOneFrame()
 		GetClientRect(g_hwnd, &rc);
 		uint32_t cw = (uint32_t)(rc.right - rc.left), ch = (uint32_t)(rc.bottom - rc.top);
 		if (cw > 0 && ch > 0 && (cw != g_clientW || ch != g_clientH)) {
-			g_clientW = cw;
-			g_clientH = ch;
-			g_swapChain->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+			// The compositor must drop its back-buffer RTV and unbind it first:
+			// ResizeBuffers fails while any back-buffer reference is outstanding.
 			g_comp->OnResize();
-			if (g_client) {
-				g_client->SetViewSize(cw, ch);
-				if (g_client->GetBrowser()) {
-					g_client->GetBrowser()->GetHost()->WasResized();
+			HRESULT hr = g_swapChain->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+			static bool resizeFailLogged = false;
+			if (SUCCEEDED(hr)) {
+				resizeFailLogged = false;
+				g_clientW = cw;
+				g_clientH = ch;
+				if (g_client) {
+					g_client->SetViewSize(cw, ch);
+					if (g_client->GetBrowser()) {
+						g_client->GetBrowser()->GetHost()->WasResized();
+					}
 				}
+			} else if (!resizeFailLogged) {
+				// Keep the old size: the swap chain still has it, so Frame and the
+				// page stay consistent with what will be presented.
+				resizeFailLogged = true;
+				LOG_ERROR("ResizeBuffers(%ux%u) failed: 0x%08lx — keeping %ux%u", cw, ch, hr, g_clientW,
+				          g_clientH);
 			}
 		}
 	}
