@@ -7,7 +7,7 @@
 // in a provisional experimental block (1004999xxx) pending official
 // assignment. Extension names are expected to be stable; numeric values are
 // not.
-// See GOVERNANCE.md.
+// See GOVERNANCE.md in https://github.com/DisplayXR/displayxr-extensions.
 //
 /*!
  * @file
@@ -26,6 +26,33 @@
  * the pair via VK_KHR_wayland_surface. Transparency is native on Wayland — a
  * surface composites its premultiplied alpha over whatever is behind it, so
  * transparentBackgroundEnabled needs no ARGB-visual dance (unlike X11).
+ *
+ * Spec v2 adds the SIZE half of the binding — @ref XrWaylandSurfaceGeometryDXR
+ * and @ref xrSetWaylandSurfaceGeometryDXR — because a wl_surface has no
+ * intrinsic size and nobody but the application can supply one:
+ *
+ *   - Wayland's WSI reports `VkSurfaceCapabilitiesKHR::currentExtent ==
+ *     {UINT32_MAX, UINT32_MAX}`: the compositor asks the CLIENT to choose, and
+ *     the buffer the client attaches is what DEFINES the surface size. A
+ *     runtime that guesses therefore does not mis-size a window — it RESIZES
+ *     it. Before v2 the guess was the panel, so every Wayland session was
+ *     forced fullscreen-on-panel.
+ *   - The compositor-side geometry service (the `window-geometry@displayxr.org`
+ *     GNOME Shell extension, docs/specs/runtime/wayland-window-geometry.md)
+ *     cannot bootstrap it: Mutter only lists a window once it has a MAPPED
+ *     buffer, and the first buffer is attached by the very swapchain whose
+ *     size is in question.
+ *   - The application always knows. It received `xdg_toplevel.configure` and
+ *     acked it before `xrCreateSession`, and it receives every later configure.
+ *
+ * So SIZE comes from the app and POSITION keeps coming from the compositor
+ * geometry service. That split is ADR-033 unchanged: both channels report
+ * GEOMETRY, and the weaver still owns all phase including snapping.
+ *
+ * The shape is lifted from the Android sibling
+ * (XR_DXR_android_surface_binding's @ref xrSetAndroidWindowGeometryDXR,
+ * ADR-036 D6) for the same underlying reason: a window fact the runtime has no
+ * way to observe from outside the app's own toolkit.
  */
 #ifndef XR_DXR_WAYLAND_SURFACE_BINDING_H
 #define XR_DXR_WAYLAND_SURFACE_BINDING_H 1
@@ -38,13 +65,64 @@ extern "C" {
 #endif
 
 #define XR_DXR_wayland_surface_binding 1
-#define XR_DXR_wayland_surface_binding_SPEC_VERSION 1
+#define XR_DXR_wayland_surface_binding_SPEC_VERSION 2
 #define XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME "XR_DXR_wayland_surface_binding"
 
-// Value from the DisplayXR provisional 1004999xxx block — decade 1004999210–219
-// (the xlib sibling claimed 200–209). Replace with an official Khronos-assigned
-// value if the extension is standardized.
-#define XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999210)
+// Window-space composition layer. Every window/surface binding extension
+// (win32, cocoa, xlib, wayland, android) enables it and declares it with this
+// SAME guarded block, so any combination of these headers can be included in
+// any order. The guard is the type value, shared by all five copies.
+#ifndef XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
+#define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR ((XrStructureType)1004999002)
+
+/*!
+ * @brief Composition layer positioned in fractional window coordinates.
+ *
+ * Renders a textured quad at a position specified as fractions of the target
+ * window dimensions. Coordinates automatically scale when the window is resized.
+ * The same texture is composited into every view with a per-eye horizontal
+ * shift controlled by the disparity parameter. The layer is composited before
+ * the display processor (it is woven like any other layer).
+ *
+ * Valid on a session created with a window/surface binding, on a session of a
+ * native compositor, and on an IPC (service) session.
+ *
+ * @extends XrFrameEndInfo (submitted as a composition layer)
+ */
+typedef struct XrCompositionLayerWindowSpaceDXR {
+    XrStructureType             type;       //!< Must be XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
+    const void* XR_MAY_ALIAS    next;       //!< Pointer to next structure in chain
+    XrCompositionLayerFlags     layerFlags; //!< e.g. XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+    XrSwapchainSubImage         subImage;   //!< Source swapchain + rect
+    float                       x;          //!< Left edge, fraction of window width  [0..1]
+    float                       y;          //!< Top edge, fraction of window height   [0..1]
+    float                       width;      //!< Fraction of window width  [0..1]
+    float                       height;     //!< Fraction of window height [0..1]
+    float                       disparity;  //!< Horizontal shift, fraction of window width.
+                                            //!< 0 = screen depth, negative = toward viewer
+} XrCompositionLayerWindowSpaceDXR;
+#endif // XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR
+
+// Value from the DisplayXR provisional 1004999xxx block — decade 1004999250–259.
+// Replace with an official Khronos-assigned value if the extension is
+// standardized.
+//
+// This was originally 1004999210, which COLLIDED with
+// XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR: the 210–219 decade already belonged to
+// XR_DXR_display_info's v16+ additions (see this directory's README.md
+// registry), not to the window-binding siblings. Both structs happened to be
+// chained onto different parents, so nothing misbehaved in practice, but two
+// distinct XrStructureType values must never share a number. Corrected to a
+// fresh decade; the extension is at SPEC_VERSION 1 and no shipped app chains
+// this struct, so the renumber breaks nothing.
+#define XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999250)
+
+// 251 = the spec-v2 geometry struct, the next free slot in this extension's own
+// 250–259 decade. Verified unique against EVERY XR_TYPE_*_DXR / extended-core-
+// enum value declared in this directory's XR_DXR_*.h headers (the 1004999xxx
+// block is shared across all of them, which is how the 1004999210 collision
+// above happened) — 1004999251 appears nowhere else in the repository.
+#define XR_TYPE_WAYLAND_SURFACE_GEOMETRY_DXR ((XrStructureType)1004999251)
 
 // Only meaningful on desktop Linux (Android also reports __linux__ but has no
 // Wayland desktop surface path).
@@ -78,6 +156,88 @@ typedef struct XrWaylandSurfaceBindingCreateInfoDXR {
     //! XrXlibWindowBindingCreateInfoDXR::transparentBackgroundEnabled.
     XrBool32                    transparentBackgroundEnabled;
 } XrWaylandSurfaceBindingCreateInfoDXR;
+
+/*!
+ * @brief The surface size (and its output's refresh) the application has
+ *        committed to — chained on XrSessionCreateInfo::next, spec v2.
+ *
+ * A wl_surface has no size of its own: the buffer the client attaches is what
+ * defines it, and Wayland's WSI answers `currentExtent == {UINT32_MAX,
+ * UINT32_MAX}` precisely to say "you choose". Chaining this tells the runtime
+ * which size to choose, so it sizes its WSI swapchain to the app's window
+ * instead of forcing the window to the panel. See the file comment for why no
+ * other party can supply it.
+ *
+ * Chained ALONGSIDE @ref XrWaylandSurfaceBindingCreateInfoDXR, never instead of
+ * it — it is a separate structure rather than two more fields on the binding
+ * because growing a published structure changes its size and breaks every app
+ * compiled against spec v1.
+ *
+ * Optional. Omitting it, or passing 0 for a field, keeps the pre-v2 behaviour
+ * for that field (panel-sized swapchain / 60 Hz), so a v1 app is unaffected.
+ *
+ * @extends XrSessionCreateInfo
+ */
+typedef struct XrWaylandSurfaceGeometryDXR {
+    XrStructureType             type;   //!< Must be XR_TYPE_WAYLAND_SURFACE_GEOMETRY_DXR
+    const void* XR_MAY_ALIAS    next;   //!< Pointer to next structure in chain
+    //! The size, in PIXELS, of the BUFFER the runtime should attach — not the
+    //! logical size from `xdg_toplevel.configure`. The two are equal at desktop
+    //! scale 1.0 and only there.
+    //!
+    //! On a fractionally-scaled desktop they differ and the difference is a
+    //! resample, which destroys a lenticular interlace. A FULLSCREEN toplevel
+    //! must report the `wl_output.mode` size of the output it is fullscreen on
+    //! (the compositor maps that buffer onto the whole output, so buffer pixels
+    //! and panel pixels line up 1:1) — e.g. declare 2880x1800 for a toplevel
+    //! configured at 1728x1080 on a 166.67% desktop. A windowed toplevel has no
+    //! such probe; report the configure size and accept that the weave is not
+    //! 1:1 unless the desktop is at 100%.
+    //!
+    //! 0 = unknown, which leaves the runtime on its pre-v2 panel-sized default.
+    uint32_t                    width;
+    uint32_t                    height;
+    //! Refresh of the `wl_output` the surface is on, in milli-hertz, exactly as
+    //! `wl_output.mode` reports it (e.g. 59997 for 59.997 Hz). The runtime
+    //! cannot query this itself on Wayland — the RandR path that serves the X11
+    //! sibling needs an XCB connection — so without it the runtime falls back to
+    //! a hardcoded 60 Hz. 0 = unknown, keep that default.
+    uint32_t                    refreshMilliHertz;
+} XrWaylandSurfaceGeometryDXR;
+
+/*!
+ * @brief Republish the surface geometry mid-session.
+ *
+ * The application calls this from its frame loop for every
+ * `xdg_toplevel.configure` whose size DIFFERS from the one in force — after
+ * acking it, never before. The runtime records the value and re-creates its WSI
+ * swapchain at the new size on the next frame, the same way the X11 leg follows
+ * an `xcb` window resize. The runtime de-duplicates, so calling it every frame
+ * with an unchanged size is a cheap no-op.
+ *
+ * Position is NOT a parameter: on Wayland it comes from the compositor-side
+ * geometry service, not from the client, which is never told where it is.
+ *
+ * @param session           A session created with a chained
+ *                          @ref XrWaylandSurfaceBindingCreateInfoDXR.
+ * @param width             New surface width in pixels; must be non-zero.
+ * @param height            New surface height in pixels; must be non-zero.
+ * @param refreshMilliHertz New refresh in milli-hertz, or 0 to leave the
+ *                          session's current value alone.
+ *
+ * @return XR_SUCCESS, XR_ERROR_HANDLE_INVALID (not a live session),
+ *         XR_ERROR_VALIDATION_FAILURE (zero width or height, or the session was
+ *         not created with a Wayland surface binding) or
+ *         XR_ERROR_FUNCTION_UNSUPPORTED (the extension was not enabled at
+ *         xrCreateInstance).
+ */
+XRAPI_ATTR XrResult XRAPI_CALL
+xrSetWaylandSurfaceGeometryDXR(XrSession session, uint32_t width, uint32_t height, uint32_t refreshMilliHertz);
+
+typedef XrResult(XRAPI_PTR *PFN_xrSetWaylandSurfaceGeometryDXR)(XrSession session,
+                                                                uint32_t width,
+                                                                uint32_t height,
+                                                                uint32_t refreshMilliHertz);
 
 #endif // defined(__linux__) && !defined(__ANDROID__)
 
