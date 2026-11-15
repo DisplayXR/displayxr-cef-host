@@ -443,8 +443,7 @@ WeaveCompositor::CompositeNView(XrSession session,
 	QueryPerformanceCounter(&t0);
 	XrResult sr = g_pfnWeaveSubmit(session, &in, &out);
 	QueryPerformanceCounter(&t1);
-	if (XR_FAILED(sr)) {
-		LogXrResult("xrWeaveSubmitDXR(v6 atlas)", sr);
+	if (!NoteSubmitResult("xrWeaveSubmitDXR(v6 atlas)", sr)) {
 		return 0;
 	}
 	if (outMs) {
@@ -549,8 +548,7 @@ WeaveCompositor::CompositeBatched(XrSession session,
 		QueryPerformanceCounter(&t0);
 		XrResult sr = g_pfnWeaveSubmit(session, &in, &out);
 		QueryPerformanceCounter(&t1);
-		if (XR_FAILED(sr)) {
-			LogXrResult("xrWeaveSubmitDXR(batch)", sr);
+		if (!NoteSubmitResult("xrWeaveSubmitDXR(batch)", sr)) {
 			return 0;
 		}
 		totalMs += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
@@ -658,8 +656,7 @@ WeaveCompositor::CompositeLegacy(XrSession session,
 		QueryPerformanceCounter(&t0);
 		XrResult sr = g_pfnWeaveSubmit(session, &in, &out);
 		QueryPerformanceCounter(&t1);
-		if (XR_FAILED(sr)) {
-			LogXrResult("xrWeaveSubmitDXR", sr);
+		if (!NoteSubmitResult("xrWeaveSubmitDXR", sr)) {
 			continue;
 		}
 		totalMs += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
@@ -695,16 +692,68 @@ WeaveCompositor::CompositeLegacy(XrSession session,
 }
 
 bool
+WeaveCompositor::NoteSubmitResult(const char *what, XrResult sr)
+{
+	if (XR_FAILED(sr)) {
+		if (!submit_failing_) {
+			submit_failing_ = true;
+			LogXrResult(what, sr);
+			LOG_ERROR("weave submit failing: presenting the page without 3D until it recovers "
+			          "(logged once per transition)");
+		}
+		return false;
+	}
+	if (submit_failing_) {
+		submit_failing_ = false;
+		LOG_INFO("weave submit recovered (%s)", what);
+	}
+	return true;
+}
+
+bool
 WeaveCompositor::Frame(XrSession session,
                        IDXGISwapChain1 *swapchain,
                        uint32_t winW,
                        uint32_t winH,
                        HostBridge &bridge,
-                       double *outMs)
+                       double *outMs,
+                       bool *outWove)
 {
-	if (!bridge.pageTex || bridge.elements.empty() || winW == 0 || winH == 0) {
+	if (outWove) {
+		*outWove = false;
+	}
+	if (!bridge.pageTex || winW == 0 || winH == 0) {
+		return false; // nothing to draw yet
+	}
+
+	// Back buffer + page SRV + render state — set up once; the page base and all
+	// woven element sub-rects composite into the same back buffer.
+	ComPtr<ID3D11Texture2D> back;
+	if (FAILED(swapchain->GetBuffer(0, IID_PPV_ARGS(&back)))) {
 		return false;
 	}
+	ComPtr<ID3D11RenderTargetView> rtv;
+	if (FAILED(device_->CreateRenderTargetView(back.Get(), nullptr, &rtv))) {
+		return false;
+	}
+	ComPtr<ID3D11ShaderResourceView> pageSrv;
+	if (FAILED(device_->CreateShaderResourceView(bridge.pageTex.Get(), nullptr, &pageSrv))) {
+		return false;
+	}
+	back_rtv_ = rtv;
+	ID3D11RenderTargetView *rtvs[1] = {rtv.Get()};
+	context_->OMSetRenderTargets(1, rtvs, nullptr);
+	float bf[4] = {1, 1, 1, 1};
+	context_->OMSetBlendState(blend_.Get(), bf, 0xffffffff);
+	D3D11_VIEWPORT vp = {0.0f, 0.0f, (float)winW, (float)winH, 0.0f, 1.0f};
+	context_->RSSetViewports(1, &vp);
+	ID3D11ShaderResourceView *nullSrv[1] = {nullptr};
+
+	// Page base (full window): the 2D surround + each element's flat SBS pixels,
+	// the latter replaced by the woven 3D below. From here on there is always a
+	// frame to present: if no element is visible or the submit fails, the caller
+	// presents this page-only composite (and Present paces the loop).
+	BlitQuad(pageSrv.Get(), 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, nullptr);
 
 	// INTERSECT each element rect with the page texture — do not clamp it. An
 	// element scrolled off the top reports a NEGATIVE y; clamping y to 0 while
@@ -734,35 +783,9 @@ WeaveCompositor::Frame(XrSession session,
 		rects.push_back({x0, y0, x1 - x0, y1 - y0});
 	}
 	if (rects.empty()) {
-		return false;
+		context_->PSSetShaderResources(0, 1, nullSrv);
+		return true; // no element visible: present the page alone
 	}
-
-	// Back buffer + page SRV + render state — set up once; the page base and all
-	// woven element sub-rects composite into the same back buffer.
-	ComPtr<ID3D11Texture2D> back;
-	if (FAILED(swapchain->GetBuffer(0, IID_PPV_ARGS(&back)))) {
-		return false;
-	}
-	ComPtr<ID3D11RenderTargetView> rtv;
-	if (FAILED(device_->CreateRenderTargetView(back.Get(), nullptr, &rtv))) {
-		return false;
-	}
-	ComPtr<ID3D11ShaderResourceView> pageSrv;
-	if (FAILED(device_->CreateShaderResourceView(bridge.pageTex.Get(), nullptr, &pageSrv))) {
-		return false;
-	}
-	back_rtv_ = rtv;
-	ID3D11RenderTargetView *rtvs[1] = {rtv.Get()};
-	context_->OMSetRenderTargets(1, rtvs, nullptr);
-	float bf[4] = {1, 1, 1, 1};
-	context_->OMSetBlendState(blend_.Get(), bf, 0xffffffff);
-	D3D11_VIEWPORT vp = {0.0f, 0.0f, (float)winW, (float)winH, 0.0f, 1.0f};
-	context_->RSSetViewports(1, &vp);
-	ID3D11ShaderResourceView *nullSrv[1] = {nullptr};
-
-	// Page base (full window): the 2D surround + each element's flat SBS pixels,
-	// the latter replaced by the woven 3D below.
-	BlitQuad(pageSrv.Get(), 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, nullptr);
 
 	// The RUNTIME's reported spec version picks the submit path — never the
 	// vendored header's (see xr_session.h). The v6 N-view atlas additionally
@@ -811,5 +834,8 @@ WeaveCompositor::Frame(XrSession session,
 
 	// Unbind the SRV (defensive; the targets are released next frame anyway).
 	context_->PSSetShaderResources(0, 1, nullSrv);
-	return wove > 0;
+	if (outWove) {
+		*outWove = wove > 0;
+	}
+	return true; // the page base is in the back buffer, woven or not
 }

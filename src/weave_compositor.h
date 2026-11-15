@@ -59,14 +59,19 @@ class WeaveCompositor {
 
 	// Weave RPC -> composite into the swap-chain back buffer. winW/winH are the
 	// window client size in device px (== bound-window / weaved size). Writes the
-	// returned eyes into `bridge`. Returns true if it composited a frame (caller
-	// then presents). outMs receives the weave round-trip latency (submit only).
+	// returned eyes into `bridge`. Returns true if the page base was drawn into
+	// the back buffer, i.e. there is a frame to present: also when no element is
+	// visible or the weave submit failed, so the window shows the live page
+	// instead of freezing on the last woven frame, and Present paces the loop.
+	// *outWove is true only if at least one element was woven this frame.
+	// outMs receives the weave round-trip latency (submit only).
 	bool Frame(XrSession session,
 	           IDXGISwapChain1 *swapchain,
 	           uint32_t winW,
 	           uint32_t winH,
 	           HostBridge &bridge,
-	           double *outMs);
+	           double *outMs,
+	           bool *outWove);
 
 	// Force the weaved handback + fence to be re-opened on the next Frame (call
 	// on window resize, since the weaved output dims change).
@@ -105,6 +110,9 @@ class WeaveCompositor {
 	              ID3D11PixelShader *ps); // nullptr = the opaque-overwrite PS
 	//! Apply the returned eyes to the bridge (identical for every element/rect).
 	static void StoreEyes(const XrWeaveOutputDXR &out, HostBridge &bridge);
+	//! Log a weave submit failure once per ok -> failing transition (and the
+	//! recovery once), never every frame. Returns true if `sr` succeeded.
+	bool NoteSubmitResult(const char *what, XrResult sr);
 
 	//! Worst-case N-view atlas for the spec-v6 path: keyed-mutex shared AND a
 	//! render target, because the host packs the tiles itself.
@@ -172,4 +180,6 @@ class WeaveCompositor {
 	Microsoft::WRL::ComPtr<ID3D11Fence> fence_;
 	uint32_t weaved_w_ = 0, weaved_h_ = 0;
 	bool have_handback_ = false;
+	//! A weave submit is currently failing (see NoteSubmitResult).
+	bool submit_failing_ = false;
 };
