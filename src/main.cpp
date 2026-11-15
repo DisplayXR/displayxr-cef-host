@@ -86,7 +86,7 @@ static void MaybeDumpComposite();
 // (g_inFrame) makes this safe to call from any message handler: CefDoMessageLoopWork
 // itself pumps the Win32 queue and can dispatch WM_PAINT/WM_TIMER mid-pump, which
 // would otherwise re-enter RunOneFrame and recurse infinitely (the earlier hang).
-static void RunOneFrame();
+static bool RunOneFrame();
 
 // Forward a wheel/move/click to the offscreen browser (OSR has no real HWND, so
 // the embedder must inject input). Coords are client/device px (dpr handled by
@@ -479,17 +479,18 @@ DemoPageUrl()
 // ---- One frame: pump CEF, handle resize, weave, composite, present ----------
 // Callable from the main loop AND from the WM_PAINT handler during a modal
 // move/resize (the WM_PAINT trick keeps the weave flowing while dragging).
-static void
+// Returns true if it presented a frame (Present(1) then paced the caller).
+static bool
 RunOneFrame()
 {
 	if (!g_frameReady || !g_xr || !g_comp || !g_bridge || !g_swapChain) {
-		return;
+		return false;
 	}
 	// Whole-frame re-entrancy guard: CefDoMessageLoopWork pumps the Win32 queue
 	// and can dispatch WM_PAINT/WM_TIMER mid-pump, re-entering this function. Run
 	// only the outermost frame to completion; drop re-entrant calls.
 	if (g_inFrame) {
-		return;
+		return false;
 	}
 	g_inFrame = true;
 	PollEvents(*g_xr);
@@ -527,10 +528,16 @@ RunOneFrame()
 	}
 
 	double ms = 0.0;
-	bool wove = g_comp->Frame(g_xr->session, g_swapChain.Get(), g_clientW, g_clientH, *g_bridge, &ms);
-	if (wove) {
+	bool wove = false;
+	// Present whenever the page base was drawn, woven or not: skipping Present
+	// froze the window on the last woven frame and let the loop spin a core.
+	const bool presented =
+	    g_comp->Frame(g_xr->session, g_swapChain.Get(), g_clientW, g_clientH, *g_bridge, &ms, &wove);
+	if (presented) {
 		MaybeDumpComposite();
 		g_swapChain->Present(1, 0);
+	}
+	if (wove) {
 		DeliverEyesToPage(*g_bridge); // page renders next frame off-axis
 		g_latSum += ms;
 		g_latCount++;
@@ -545,6 +552,7 @@ RunOneFrame()
 		g_frameIdx++;
 	}
 	g_inFrame = false;
+	return presented;
 }
 
 // -----------------------------------------------------------------------------
@@ -682,9 +690,8 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int)
 			TranslateMessage(&msg);
 			DispatchMessage(&msg);
 		}
-		RunOneFrame();
-		if (!bridge.pageTex || bridge.elements.empty()) {
-			Sleep(2); // no page texture / element rects yet — don't busy-spin
+		if (!RunOneFrame()) {
+			Sleep(2); // nothing presented (no page texture yet), don't busy-spin
 		}
 	}
 	g_frameReady = false;
