@@ -68,9 +68,12 @@ class WeaveCompositor {
 	           HostBridge &bridge,
 	           double *outMs);
 
-	// Force the weaved handback + fence to be re-opened on the next Frame (call
-	// on window resize, since the weaved output dims change).
-	void OnResize() { have_handback_ = false; }
+	// Call BEFORE IDXGISwapChain::ResizeBuffers. Drops this compositor's
+	// reference to the back buffer (back_rtv_), unbinds it from the output
+	// merger and flushes, because ResizeBuffers fails while any reference to a
+	// back buffer is outstanding. Also forces the weaved handback + fence to be
+	// re-opened on the next Frame, since the weaved output dims change.
+	void OnResize();
 
 	// Hand over the active rendering mode's atlas geometry (from
 	// QueryWeaveModeInfo) to enable the spec-v6 N-view submit path. Without it
